@@ -9,16 +9,19 @@
 #include <unistd.h>
 #include "dp45_64.h"
 #include "cublas_v2.h"
+#include <cufft.h>
 
 typedef struct parameters
 {
   cublasHandle_t handle;
+  cufftHandle *plans;
   unsigned long int N;
-  double *y2;
-  double *f2;
-  double *f3;
-  double *floc;
-  double c1;
+  double *Y;
+  double *yfft;
+  double *theta;
+  int *eta;
+  int *nu;
+  int N_eta;
   double t0;
   double t1;
   int steps;
@@ -28,26 +31,50 @@ typedef struct parameters
   int n_eval;
   int eval_i;
   double *yloc;
-  double *ones;
   char *filebase;
   struct timeval start;
 }parameters;
 
 
-__global__ void make_dict (double* Y, const unsigned long int N, double** dict, const unsigned int N_eta, int *eta, ) {
+__global__ void make_dict (double* Y, const unsigned long int N, double* dict, const unsigned int N_eta, int* eta, int* nu) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<N){
     for (int j=0; j<N_eta; j++){
-      dict[i+N*j]*=pow(y[eta[2*j]],eta[2*j+1]);
+      dict[i+N*j]*=pow(Y[nu[j]],eta[j]);
     }
   }
 }
 
 void dydt (double t, double *y, double *f, void *pars){
   parameters *p = (parameters *)pars;
-  makeY(y);
-  make_dict<<<(p->N+255)/256, 256>>>(y, p->N, p->y2, f, p->f2, p->omegas, p->c1);
+  // makeY(y);
+  make_dict<<<(p->N+255)/256, 256>>>(p->Y, p->N, p->theta, p->N_eta, p->eta, p->nu);
 
+}
+
+
+void planfft(double *y, int ndim, int *Ns, cufftHandle *plans){
+  int N=1;
+  for (int i=0; i<ndim; i++){
+    N=N*Ns[i];
+  }
+  for (int i=0; i<ndim; i++){
+    int stride=1;
+    int dist=Ns[0];
+    int batch_size=int(N/Ns[i]);
+    for (int j=0; j<i; j++){
+      stride=stride*Ns[j];
+      dist=dist*Ns[j+1];
+    }
+    int *n=&Ns[i];
+    cufftPlanMany(&plans[i], 1, n, NULL, stride, dist, NULL, stride, dist, CUFFT_D2Z, batch_size);
+  }
+}
+
+void execfft(double *y, cufftDoubleComplex *yfft, int ndim, cufftHandle *plans){
+    for (int i=0; i<ndim; i++){
+      cufftExecD2Z(plans[i], y, yfft);
+    }
 }
 
 
@@ -77,7 +104,7 @@ void step_eval(double t, double h, double* y, void *pars){
     fclose(outtimes);
   }
 
-  FILE *outanimation, *outcouplings;
+  FILE *outanimation;
   if(p->dense>=1){
     strcpy(file,p->filebase);
     strcat(file, "thetas.dat");
@@ -118,7 +145,6 @@ void step_eval(double t, double h, double* y, void *pars){
   fwrite(p->yloc,sizeof(double),p->N,outlast);
   fwrite(&t,sizeof(double),1,outlast);
   fwrite(&h,sizeof(double),1,outlast);
-  fwrite(p->floc,sizeof(double),2*p->N,outlast);
   fflush(outlast);
   fclose(outlast);
 }
@@ -127,18 +153,14 @@ int main (int argc, char* argv[]) {
     struct timeval start,end;
     gettimeofday(&start,NULL);
 
-    double c1, t1, dt;
-    double freq, atl, rtl, I;
-    int gpu, seed, fixed, A;
-    unsigned long int N,K;
+    double t1, dt;
+    double atl, rtl, I;
+    int gpu, seed, fixed;
+    unsigned long int N;
     char* filebase;
 
     N=5000;
-    K=6;
-    A=0;
     I=0;
-    c1=3.0;
-    freq=1.0;
 
     t1=1e2;
     dt=1e0;
@@ -153,24 +175,16 @@ int main (int argc, char* argv[]) {
     int dense=3;
     int normal=0;
     int reload=0;
+    int ndim=2;
 
     while (optind < argc) {
-      if ((c = getopt(argc, argv, "N:K:I:D:c:g:t:d:f:s:r:a:hvFnRA")) != -1) {
+      if ((c = getopt(argc, argv, "N:I:D:g:t:d:s:r:a:hvFnR")) != -1) {
         switch (c) {
           case 'N':
               N = (int)atoi(optarg);
               break;
-          case 'K':
-              K = (int)atoi(optarg);
-              break;
-          case 'A':
-              A = 1;
-              break;
           case 'I':
               I = (double)atof(optarg);
-              break;
-          case 'c':
-              c1 = (double)atof(optarg);
               break;
           case 'g':
               gpu = (double)atof(optarg);
@@ -180,9 +194,6 @@ int main (int argc, char* argv[]) {
               break;
           case 'd':
               dt = (double)atof(optarg);
-              break;
-          case 'f':
-              freq = (double)atof(optarg);
               break;
           case 's':
               seed = (int)atoi(optarg);
@@ -194,7 +205,7 @@ int main (int argc, char* argv[]) {
               atl = (double)atof(optarg);
               break;
           case 'D':
-              dense = (int)atoi(optarg);
+              ndim = (int)atoi(optarg);
               break;
           case 'R':
               reload = 1;
@@ -220,19 +231,16 @@ int main (int argc, char* argv[]) {
       }
     }
     if (help) {
-      printf("usage:\tkuramoto [-hvnRFA] [-N N] [-K K] [-D D]\n");
+      printf("usage:\trdcu [-hvnRFA] [-N N] [-K K] [-D D]\n");
       printf("\t[-c c] [-t t] [-d dt] [-f f] [-s seed] \n");
       printf("\t[-I init] [-r rtol] [-a atol] [-g gpu] filebase \n\n");
       printf("-h for help \n");
       printf("-v for verbose \n");
       printf("-n for normal random frequencies (default is cauchy) \n");
-      printf("-R to reload adjacency, frequencies, and initial conditions from files if possible\n");
+      printf("-R to reload initial conditions from files if possible\n");
       printf("-F for fixed timestep \n");
-      printf("-A to regenerate volcano adjacency each step to save memory \n");
-      printf("D is the output density level. 0 for minimal, 1 for phases, 2 for phases and couplings, 3 for phases, couplings, and adjacency\n");
+      printf("D is the dimension\n");
       printf("N is number of oscillators. Default 5000. \n");
-      printf("K is rank of volcano adjacency. Default 5. \n");
-      printf("c is the coupling coefficient. Default 3.0. \n");
       printf("t is total integration time. Default 1e2. \n");
       printf("dt is the time between outputs. Default 1e0. \n");
       printf("f is the scale of the frequencies. Default 1e0. \n");
@@ -256,14 +264,12 @@ int main (int argc, char* argv[]) {
     strcat(file,".out");
     out = fopen(file,"ab");
 
-    double *omegasloc, *omegas, *yloc, *adjloc, *adj, *y2, *f2, *f3, *floc, *ones;
+    double *yloc, *y, *yfft, *Y, *theta;
     yloc = (double*)calloc(N,sizeof(double));
-    floc = (double*)calloc(2*N,sizeof(double));
-    omegasloc = (double*)calloc(N,sizeof(double));
-    adjloc = (double*)calloc(N*N,sizeof(double));
 
     cublasStatus_t stat;
     cublasHandle_t handle;
+    cufftHandle *plans = (cufftHandle*) malloc(ndim * sizeof(cufftHandle));
 
     cudaSetDevice(gpu);
     stat = cublasCreate(&handle);
@@ -274,46 +280,28 @@ int main (int argc, char* argv[]) {
     }
     srand(seed);
 
-    fprintf(out,"%lu %lu %f %f %f %i\n", N, K, t1, dt, c1, seed);
     for (int  i=0; i<argc; i++){
       fprintf(out, "%s ", argv[i]);
     }
     fprintf(out, "\n");
 
-    size_t fr, total, req;
-    cudaMemGetInfo (&fr, &total);
-    if(A){
-      req=100*N*sizeof(double);
-    }
-    else{
-      req=(100+N+2*K)*N*sizeof(double);
-    }
-    printf("GPU Memory: %lu %lu %lu\n", fr, total, req);
-    fprintf(out,"GPU Memory: %lu %lu %lu\n", fr, total, req);
-    if(fr < req) {
-      printf("GPU Memory low!\n");
-      fprintf(out,"GPU Memory low!\n");
-      return 0;
-    }
-    fflush(out);
+//     size_t fr, total, req;
+//     cudaMemGetInfo (&fr, &total);
+//     req=(100+N)*N*sizeof(double);
+//
+//     printf("GPU Memory: %lu %lu %lu\n", fr, total, req);
+//     fprintf(out,"GPU Memory: %lu %lu %lu\n", fr, total, req);
+//     if(fr < req) {
+//       printf("GPU Memory low!\n");
+//       fprintf(out,"GPU Memory low!\n");
+//       return 0;
+//     }
+//     fflush(out);
 
-
-    cudaMalloc ((void**)&omegas, N*sizeof(double));
-    cudaMalloc ((void**)&y2, 2*N*sizeof(double));
-    cudaMalloc ((void**)&f2, 2*N*sizeof(double));
-    cudaMalloc ((void**)&f3, 2*K*sizeof(double));
-    if(!A){
-      cudaMalloc((void**)&adj,sizeof(double)*N*N);
-    }
-    cudaMalloc((void**)&ones,sizeof(double)*N);
-    for(int i=0; i<N; i++){
-      yloc[i]=1;
-    }
-    cublasSetVector(N, sizeof(double), yloc, 1, ones, 1);
-
-    curandStatePhilox4_32_10_t *state;
-    cudaMalloc((void**)&state,sizeof(curandStatePhilox4_32_10_t));
-    makestate<<<1, 1>>>(state,seed);
+    cudaMalloc ((void**)&y, 2*N*sizeof(double));
+    cudaMalloc ((void**)&yfft, 2*N*sizeof(double));
+    cudaMalloc ((void**)&Y, 2*N*sizeof(double));
+    cudaMalloc ((void**)&theta, 2*N*sizeof(double));
 
     if (fixed){
       h = dt;
@@ -343,7 +331,7 @@ int main (int argc, char* argv[]) {
         if (read!=1){
           printf("Couldn't read start time and step!\n");
           fprintf(out,"Couldn't read start time and step!\n");
-          reloaded=0;
+          // reloaded=0;
         }
       }
       fclose(in);
@@ -360,44 +348,9 @@ int main (int argc, char* argv[]) {
       in=fopen(file,"wb");
       fwrite(yloc,sizeof(double),N,in);
       fclose(in);
-
-      cublasSetVector(N, sizeof(double), yloc, 1, omegas, 1);
     }
 
-    strcpy(file,filebase);
-    strcat(file, "frequencies.dat");
-    if (reload && (in = fopen(file,"r")))
-    {
-        printf("Using frequencies from file\n");
-        fprintf(out, "Using frequencies from file\n");
-        size_t read=fread(omegasloc,sizeof(double),N,in);
-        fclose(in);
-        if (read!=N){
-          printf("frequencies not compatible with N!");
-          fprintf(out,"frequencies not compatible with N!");
-          return 0;
-        }
-    }
-    else {
 
-        printf("Using random frequencies\n");
-        fprintf(out, "Using random frequencies\n");
-        for(j=0; j<N; j++) {
-          if (normal){
-            double u = rand() / (double)RAND_MAX;
-            double v = rand() / (double)RAND_MAX;
-            omegasloc[j] = freq*pow(-2*log(u),0.5)*cos(2*M_PI*v);
-
-          }
-          else{
-            double u = rand() / (double)RAND_MAX;
-            omegasloc[j] = freq*tan(M_PI * (u - 0.5));
-          }
-        }
-        in=fopen(file,"wb");
-        fwrite(omegasloc,sizeof(double),N,in);
-        fclose(in);
-    }
 
     int n0=int(t/dt)+1;
     int n1=int(t1/dt)+1;
@@ -408,59 +361,16 @@ int main (int argc, char* argv[]) {
       t_eval[ind++]=dt*n;
     }
 
-    cublasSetVector (N, sizeof(double), omegasloc, 1, omegas, 1);
 
+    parameters pars={.handle=handle, .plans=plans, .N=N, .Y=Y, .yfft=yfft, .theta=theta, .t0=t, .t1=t1, .steps=0, .verbose=verbose, .dense=dense, .t_eval=t_eval, .n_eval=n_eval, .eval_i=0, .yloc=yloc, .filebase=filebase,.start=start};
 
-    parameters pars={.handle=handle, .N=N, .K=K, .A=A, .y2=y2, .f2=f2, .f3=f3, .floc=floc, .omegas=omegas, .adj=adj, .c1=c1, .t0=t, .t1=t1, .steps=0, .verbose=verbose, .dense=dense, .t_eval=t_eval, .n_eval=n_eval, .eval_i=0, .yloc=yloc, .ones=ones, .filebase=filebase,.start=start, .state=state};
+    y=dp45_init(N, atl, rtl, fixed, yloc, handle, &dydt);
 
-    strcpy(file,filebase);
-    strcat(file, "adj.dat");
-    if (!A && reload && (in = fopen(file,"r")))
-    {
-        printf("Using adjacency from file\n");
-        fprintf(out, "Using adjacency from file\n");
-        size_t read=fread(adjloc,sizeof(double),N*N,in);
-        fclose(in);
-        cublasSetVector(N*N, sizeof(double), adjloc, 1, adj, 1);
-    }
-    else {
-        printf("Using random adjacency matrix\n");
-        fprintf(out, "Using random adjacency matrix\n");
-        if(!A){
-          getadj(&pars);
-          if (dense){
-            cublasGetVector(N*N, sizeof(double), adj, 1, adjloc, 1);
-            if (dense>=3) {
-              in=fopen(file,"wb");
-              fwrite(adjloc,sizeof(double),N*N,in);
-              fclose(in);
-            }
-          }
-        }
-    }
-    fflush(out);
-    fclose(out);
-
-    double* y=dp45_init(N, atl, rtl, fixed, yloc, handle, &dydt);
-
+    //initial state output
     if(!reloaded){
-      strcpy(file,filebase);
-      strcat(file,"order.dat");
-      FILE *outorder=fopen(file,"wb");
-
-      makey2<<<(N+255)/256, 256>>>(y, N, y2, omegas, t);
-
-      double X,Y;
-      cublasDdot(handle,N, y2, 2, ones, 1, &X);
-      cublasDdot(handle,N, y2+1, 2, ones, 1, &Y);
-      double r=pow((X/N*X/N+Y/N*Y/N),0.5);
-      fwrite(&r,sizeof(double),1,outorder);
-      fflush(outorder);
-      fclose(outorder);
-
       if(dense>=1){
         strcpy(file,filebase);
-        strcat(file,"thetas.dat");
+        strcat(file,"states.dat");
         FILE *outanimation=fopen(file,"wb");
         fwrite(yloc,sizeof(double),N,outanimation);
         fflush(outanimation);
@@ -469,19 +379,7 @@ int main (int argc, char* argv[]) {
         strcat(file,"times.dat");
         FILE *outtimes=fopen(file,"wb");
         fclose(outtimes);
-
       }
-      if(dense>=2){
-        makecoupling(t,y2,f2,&pars);
-        cublasGetVector(2*N, sizeof(double), f2, 1, floc, 1);
-        strcpy(file,filebase);
-        strcat(file,"couplings.dat");
-        FILE *outcouplings=fopen(file,"wb");
-        fwrite(floc,sizeof(double),2*N,outcouplings);
-        fflush(outcouplings);
-        fclose(outcouplings);
-      }
-
     }
 
     double *y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
@@ -489,10 +387,7 @@ int main (int argc, char* argv[]) {
     //final state output with coupling appended
     parameters *p = &pars;
     y_eval=dp45_eval(t,p->t_eval[p->n_eval-1]);
-    makey2<<<(p->N+255)/256, 256>>>(y_eval, p->N, p->y2, p->omegas, t);
-    makecoupling(t,p->y2,p->f2,p);
     cublasGetVector(p->N, sizeof(double), y_eval, 1, p->yloc, 1);
-    cublasGetVector(2*p->N, sizeof(double), p->f2, 1, p->floc, 1);
 
     strcpy(file,p->filebase);
     strcat(file,"fs.dat");
@@ -501,7 +396,7 @@ int main (int argc, char* argv[]) {
     fwrite(p->yloc,sizeof(double),p->N,outlast);
     fwrite(&t,sizeof(double),1,outlast);
     fwrite(&h,sizeof(double),1,outlast);
-    fwrite(p->floc,sizeof(double),2*p->N,outlast);
+
     fflush(outlast);
     fclose(outlast);
 
@@ -516,18 +411,10 @@ int main (int argc, char* argv[]) {
     fclose(out);
 
     free(yloc);
-    free(floc);
-    free(omegasloc);
-    if(!A){
-      free(adjloc);
-      cudaFree(adj);
-    }
-
-    cudaFree(omegas);
-    cudaFree(y2);
-    cudaFree(f2);
-    cudaFree(f3);
-    cudaFree(state);
+    cudaFree(y);
+    cudaFree(yfft);
+    cudaFree(Y);
+    cudaFree(theta);
 
     dp45_destroy();
 
