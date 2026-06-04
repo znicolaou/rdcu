@@ -175,13 +175,24 @@ int main (int argc, char* argv[]) {
     int dense=3;
     int normal=0;
     int reload=0;
-    int ndim=2;
+    int Ns[100];
+    const char delim[] = ",";
+    char* token;
+    int ndim=0;
 
     while (optind < argc) {
       if ((c = getopt(argc, argv, "N:I:D:g:t:d:s:r:a:hvFnR")) != -1) {
         switch (c) {
           case 'N':
-              N = (int)atoi(optarg);
+              token = strtok(optarg, delim);
+              while (token != NULL) {
+                Ns[ndim++]=(int)atoi(token);
+                token = strtok(NULL, delim);
+                if (ndim>=100){
+                  printf("Too many dimension!");
+                  return 0;
+                }
+              }
               break;
           case 'I':
               I = (double)atof(optarg);
@@ -205,7 +216,7 @@ int main (int argc, char* argv[]) {
               atl = (double)atof(optarg);
               break;
           case 'D':
-              ndim = (int)atoi(optarg);
+              dense = (int)atoi(optarg);
               break;
           case 'R':
               reload = 1;
@@ -284,6 +295,9 @@ int main (int argc, char* argv[]) {
       fprintf(out, "%s ", argv[i]);
     }
     fprintf(out, "\n");
+
+    printf("%i",ndim);
+    return 0;
 
 //     size_t fr, total, req;
 //     cudaMemGetInfo (&fr, &total);
@@ -366,6 +380,8 @@ int main (int argc, char* argv[]) {
 
     y=dp45_init(N, atl, rtl, fixed, yloc, handle, &dydt);
 
+    planfft(y, ndim, Ns, plans);
+
     //initial state output
     if(!reloaded){
       if(dense>=1){
@@ -382,7 +398,8 @@ int main (int argc, char* argv[]) {
       }
     }
 
-    double *y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
+    double *y_eval;
+    // y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
 
     //final state output with coupling appended
     parameters *p = &pars;
