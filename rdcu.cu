@@ -34,28 +34,19 @@ typedef struct parameters
 }parameters;
 
 
-//replace with fft pseudospectral derivatives
-void makecoupling(double t, double *y, double *f, void* pars){
-  parameters *p = (parameters *)pars;
-  if(p->A){
-    m1<<<(p->K+255)/256, 256>>> (y,p->f3, p->N, p->K, p->state);
-    m2<<<(p->N+255)/256, 256>>> (p->f3,f, p->N, p->K, p->state);
-  }
-  else{
-    double alpha=1;
-    double beta=0;
-    cublasDgemv(p->handle, CUBLAS_OP_T, p->N, p->N, &alpha, p->adj, p->N, p->y2, 2, &beta, f, 2);
-    cublasDgemv(p->handle, CUBLAS_OP_T, p->N, p->N, &alpha, p->adj, p->N, (p->y2)+1, 2, &beta, f+1, 2);
+__global__ void make_dict (double* Y, const unsigned long int N, double** dict, const unsigned int N_eta, int *eta, ) {
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i<N){
+    for (int j=0; j<N_eta; j++){
+      dict[i+N*j]*=pow(y[eta[2*j]],eta[2*j+1]);
+    }
   }
 }
 
 void dydt (double t, double *y, double *f, void *pars){
-
   parameters *p = (parameters *)pars;
-
-  makey2<<<(p->N+255)/256, 256>>>(y, p->N, p->y2, p->omegas, t);
-  makecoupling(t,p->y2,p->f2,pars);
-  tot_kuramoto<<<(p->N+255)/256, 256>>>(y, p->N, p->y2, f, p->f2, p->omegas, p->c1);
+  makeY(y);
+  make_dict<<<(p->N+255)/256, 256>>>(y, p->N, p->y2, f, p->f2, p->omegas, p->c1);
 
 }
 
