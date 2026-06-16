@@ -17,7 +17,7 @@ typedef struct parameters
   cufftHandle *plans;
   unsigned long int N;
   double *Y;
-  double *yfft;
+  cufftDoubleComplex *yfft;
   double *theta;
   int *eta;
   int *nu;
@@ -45,37 +45,21 @@ __global__ void make_dict (double* Y, const unsigned long int N, double* dict, c
   }
 }
 
+
+void makeY (double *y, void *pars){
+  parameters *p = (parameters *)pars;
+  cublasDcopy(p->handle, p->n*p->N, y, 1, (double *)(p->yfft), 2);
+  cufftExecZ2Z(p->plans[0], p->yfft, p->yfft, CUFFT_FORWARD);
+  //multiply by frequencies and take inverse fft
+}
 void dydt (double t, double *y, double *f, void *pars){
   parameters *p = (parameters *)pars;
-  // makeY(y);
+
+  makeY(y, pars);
   make_dict<<<(p->N+255)/256, 256>>>(p->Y, p->N, p->theta, p->N_eta, p->eta, p->nu);
 
 }
 
-
-void planfft(double *y, int ndim, int *Ns, cufftHandle *plans){
-  int N=1;
-  for (int i=0; i<ndim; i++){
-    N=N*Ns[i];
-  }
-  for (int i=0; i<ndim; i++){
-    int stride=1;
-    int dist=Ns[0];
-    int batch_size=int(N/Ns[i]);
-    for (int j=0; j<i; j++){
-      stride=stride*Ns[j];
-      dist=dist*Ns[j+1];
-    }
-    int *n=&Ns[i];
-    cufftPlanMany(&plans[i], 1, n, NULL, stride, dist, NULL, stride, dist, CUFFT_D2Z, batch_size);
-  }
-}
-
-void execfft(double *y, cufftDoubleComplex *yfft, int ndim, cufftHandle *plans){
-    for (int i=0; i<ndim; i++){
-      cufftExecD2Z(plans[i], y, yfft);
-    }
-}
 
 
 void step_eval(double t, double h, double* y, void *pars){
@@ -110,16 +94,6 @@ void step_eval(double t, double h, double* y, void *pars){
     strcat(file, "thetas.dat");
     outanimation = fopen(file,"ab");
   }
-
-
-  double X,Y;
-  static double *r=(double*)calloc(p->n_eval,sizeof(double));
-  int eval_j=p->eval_i;
-  while (t >= p->t_eval[eval_j] && eval_j<p->n_eval){
-    eval_j++;
-  }
-  int num=eval_j-p->eval_i;
-  int ind=0;
 
   while (t >= p->t_eval[p->eval_i] && p->eval_i<p->n_eval){
     double *y_eval;
@@ -156,11 +130,12 @@ int main (int argc, char* argv[]) {
     double t1, dt;
     double atl, rtl, I;
     int gpu, seed, fixed;
-    unsigned long int N;
+    unsigned long int N, n;
     char* filebase;
 
-    N=5000;
-    I=0;
+    N=128;
+    n=1;
+    I=1;
 
     t1=1e2;
     dt=1e0;
@@ -173,26 +148,28 @@ int main (int argc, char* argv[]) {
     char c;
     int help=1;
     int dense=3;
-    int normal=0;
     int reload=0;
     int Ns[100];
-    const char delim[] = ",";
+    int ndim=0;    const char delim[] = ",";
     char* token;
-    int ndim=0;
+
 
     while (optind < argc) {
-      if ((c = getopt(argc, argv, "N:I:D:g:t:d:s:r:a:hvFnR")) != -1) {
+      if ((c = getopt(argc, argv, "N:n:I:D:g:t:d:s:r:a:hvFR")) != -1) {
         switch (c) {
           case 'N':
               token = strtok(optarg, delim);
               while (token != NULL) {
                 Ns[ndim++]=(int)atoi(token);
                 token = strtok(NULL, delim);
-                if (ndim>=100){
+                if (ndim>3){
                   printf("Too many dimension!");
                   return 0;
                 }
               }
+              break;
+          case 'n':
+              n = (int)atoi(optarg);
               break;
           case 'I':
               I = (double)atof(optarg);
@@ -230,9 +207,6 @@ int main (int argc, char* argv[]) {
           case 'v':
               verbose=1;
               break;
-          case 'n':
-              normal=1;
-              break;
         }
       }
       else {
@@ -242,21 +216,23 @@ int main (int argc, char* argv[]) {
       }
     }
     if (help) {
-      printf("usage:\trdcu [-hvnRFA] [-N N] [-K K] [-D D]\n");
-      printf("\t[-c c] [-t t] [-d dt] [-f f] [-s seed] \n");
-      printf("\t[-I init] [-r rtol] [-a atol] [-g gpu] filebase \n\n");
+      printf("usage:\trdcu [-hvnRFA] [-N N] [-n n] [-D D]\n");
+      printf("\t[-c c] [-e e] [-i i] [-t t] [-d dt] [-s seed] \n");
+      printf("\t[-I I] [-r rtol] [-a atol] [-g gpu] filebase \n\n");
       printf("-h for help \n");
       printf("-v for verbose \n");
-      printf("-n for normal random frequencies (default is cauchy) \n");
       printf("-R to reload initial conditions from files if possible\n");
       printf("-F for fixed timestep \n");
-      printf("D is the dimension\n");
-      printf("N is number of oscillators. Default 5000. \n");
+      printf("D is the output density\n");
+      printf("N is number of grid points in each dimension, separated by commas. \n");
+      printf("n is number of fields. \n");
+      printf("c is a list of coupling constants, separated by commas \n");
+      printf("e is a list of exponents, separated by commas \n");
+      printf("i is a list of indices, separated by commas \n");
+      printf("I is uniform random initial condition scale. Default 1. \n");
       printf("t is total integration time. Default 1e2. \n");
       printf("dt is the time between outputs. Default 1e0. \n");
-      printf("f is the scale of the frequencies. Default 1e0. \n");
       printf("seed is random seed. Default 1. \n");
-      printf("init is uniform random initial condition scale. Default 0. \n");
       printf("rtol is relative error tolerance. Default 0.\n");
       printf("atol is absolute error tolerance. Default 1e-6.\n");
       printf("gpu is index of the gpu. Default 0.\n");
@@ -267,7 +243,7 @@ int main (int argc, char* argv[]) {
     }
 
     double t=0,h;
-    int j=0;
+    int i=0,j=0;
     FILE *out, *in;
 
     char file[256];
@@ -275,12 +251,18 @@ int main (int argc, char* argv[]) {
     strcat(file,".out");
     out = fopen(file,"ab");
 
-    double *yloc, *y, *yfft, *Y, *theta;
-    yloc = (double*)calloc(N,sizeof(double));
+    double *yloc, *y, *Y, *theta;
+    cufftDoubleComplex *yfft, *yfftloc;
+    N=Ns[0];
+    for (i=1; i<ndim; i++){
+      N*=Ns[i];
+    }
+    yloc = (double*)calloc(n*N,sizeof(double));
+    yfftloc = (cufftDoubleComplex*)calloc(n*N,sizeof(cufftDoubleComplex));
 
     cublasStatus_t stat;
     cublasHandle_t handle;
-    cufftHandle *plans = (cufftHandle*) malloc(ndim * sizeof(cufftHandle));
+    cufftHandle *plans = (cufftHandle*) malloc(1 * sizeof(cufftHandle));
 
     cudaSetDevice(gpu);
     stat = cublasCreate(&handle);
@@ -296,8 +278,6 @@ int main (int argc, char* argv[]) {
     }
     fprintf(out, "\n");
 
-    printf("%i",ndim);
-    return 0;
 
 //     size_t fr, total, req;
 //     cudaMemGetInfo (&fr, &total);
@@ -312,10 +292,11 @@ int main (int argc, char* argv[]) {
 //     }
 //     fflush(out);
 
-    cudaMalloc ((void**)&y, 2*N*sizeof(double));
-    cudaMalloc ((void**)&yfft, 2*N*sizeof(double));
-    cudaMalloc ((void**)&Y, 2*N*sizeof(double));
-    cudaMalloc ((void**)&theta, 2*N*sizeof(double));
+    int num_derivs = 1+ndim+(ndim*(ndim+1))/2;
+    cudaMalloc ((void**)&y, n*N*sizeof(double));
+    cudaMalloc ((void**)&yfft, n*N*sizeof(cufftDoubleComplex));
+    cudaMalloc ((void**)&Y, num_derivs*n*N*sizeof(double));
+    cudaMalloc ((void**)&theta, n*N*sizeof(double));
 
     if (fixed){
       h = dt;
@@ -327,13 +308,12 @@ int main (int argc, char* argv[]) {
     strcpy(file,filebase);
     strcat(file, "fs.dat");
 
-
     int reloaded=0;
     if (reload && (in = fopen(file,"r"))){
       reloaded=1;
       printf("Using initial conditions from file\n");
       fprintf(out, "Using initial conditions from file\n");
-      size_t read=fread(yloc,sizeof(double),N,in);
+      size_t read=fread(yloc,sizeof(double),n*N,in);
       if (read!=N){
         printf("initial conditions file not compatible with N!\n");
         fprintf(out,"initial conditions file not compatible with N!\n");
@@ -356,11 +336,14 @@ int main (int argc, char* argv[]) {
     if (!reloaded) {
       printf("Using random initial conditions\n");
       fprintf(out, "Using random initial conditions\n");
-      for(j=0; j<N; j++) {
-        yloc[j] = I/2*(2.0/RAND_MAX*rand()-1);
+      for(i=0; i<n; i++){
+        for(j=0; j<N; j++) {
+          yloc[N*i+j] = I/2*(2.0/RAND_MAX*rand()-1);
+          yfftloc[N*i+j] = {0.0,0.0};
+        }
       }
       in=fopen(file,"wb");
-      fwrite(yloc,sizeof(double),N,in);
+      fwrite(yloc,sizeof(double),n*N,in);
       fclose(in);
     }
 
@@ -375,12 +358,30 @@ int main (int argc, char* argv[]) {
       t_eval[ind++]=dt*n;
     }
 
-
+    
+    cufftPlanMany(plans, ndim, Ns, NULL, 1, 0, NULL, 1, 0, CUFFT_Z2Z, n);
     parameters pars={.handle=handle, .plans=plans, .N=N, .Y=Y, .yfft=yfft, .theta=theta, .t0=t, .t1=t1, .steps=0, .verbose=verbose, .dense=dense, .t_eval=t_eval, .n_eval=n_eval, .eval_i=0, .yloc=yloc, .filebase=filebase,.start=start};
 
-    y=dp45_init(N, atl, rtl, fixed, yloc, handle, &dydt);
+    y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
+    cublasSetVector(n*N, sizeof(double), yloc, 1, y, 1);
+    cublasSetVector(n*N, sizeof(cufftDoubleComplex), yfftloc, 1, yfft, 1);
 
-    planfft(y, ndim, Ns, plans);
+    //////////////////////////////////////////////////////////////////////////
+
+
+
+    cublasGetVector(n*N, sizeof(double), p->Y, 1, yloc, 1);
+
+    strcpy(file,filebase);
+    strcat(file,"Y.dat");
+    FILE *outtmp=fopen(file,"wb");
+
+    fwrite(yloc,sizeof(double),n*N,outtmp);
+
+    fflush(outtmp);
+    fclose(outtmp);
+    return 0;
+    //////////////////////////////////////////////////////////////////////////
 
     //initial state output
     if(!reloaded){
