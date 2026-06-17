@@ -19,10 +19,11 @@ typedef struct parameters
   int *Ns;
   cufftDoubleComplex *Y;
   cufftDoubleComplex *yfft;
-  int *index;
-  int *eta;
+  int *mu;
   int *nu;
-  int N_eta;
+  double *C;
+  int *eta;
+  int n_terms;
   double t0;
   double t1;
   int steps;
@@ -37,16 +38,14 @@ typedef struct parameters
 }parameters;
 
 
-__global__ void make_dict (double* Y, const int N, double* dict, const int N_eta, int* eta, int* nu) {
+__global__ void add_term (double* f, double* Y, const int N, double C, int eta) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<N){
-    for (int j=0; j<N_eta; j++){
-      dict[i+N*j]*=pow(Y[nu[j]],eta[j]);
-    }
+      f[i]+=C*pow(Y[i],eta);
   }
 }
 
-__global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int N, const int n, int *Ns, const int ndim, const int axis) {
+__global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int N, const int n, int *Ns, double *Ls, const int ndim, const int axis) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<N*n){
     //find the index for the specified axis
@@ -57,9 +56,9 @@ __global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int
     int na=j%Ns[axis];
 
     //multiply by frequency in the specified axis
-    double freq=na*1.0/Ns[axis];
-    if (freq>0.5){
-      freq=freq-1.0;
+    double freq=na*Ls[axis]/Ns[axis];
+    if (freq>0.5*Ls[axis]{
+      freq=freq-Ls[axis];
     }
     Yout[i].x=-freq*Yin[i].y;
     Yout[i].y=freq*Yin[i].x;
@@ -88,8 +87,11 @@ void dydt (double t, double *y, double *f, void *pars){
   parameters *p = (parameters *)pars;
 
   makeY(y, pars);
-  //loop through the dictionary terms and add monomials to f
-  // make_dict<<<(p->N+255)/256, 256>>>(p->Y, p->N, p->theta, p->N_eta, p->eta, p->nu);
+  double scale=0.0;
+  cublasDscal(p->handle, 2*p->N*p->n, &scale, f, 1);
+  for (int i=0; i<p->n_terms; i++){
+    add_term<<<(p->N+255)/256, 256>>>(&(f[N*mu[i]]), &(p->Y[N*nu[i]]), p->N, p->C[i], p->eta[i]);
+  }
 
 }
 
@@ -158,6 +160,23 @@ void step_eval(double t, double h, double* y, void *pars){
   fclose(outlast);
 }
 
+void parse_list(const char *optarg, const char* delim, int *lst, int *len, int max_len){
+  ndim=0;
+  *len=0;
+  if (optarg != NULL) {
+    char *optarg_copy = strdup(optarg);
+    char *token = strtok(optarg_copy, delim);
+    while (token != NULL) {
+      lst[*len++]=(int)atoi(token);
+      token = strtok(NULL, delim);
+      if (*len>max_len){
+        printf("List is too long!");
+        exit(0);
+      }
+    }
+  }
+}
+
 int main (int argc, char* argv[]) {
     struct timeval start,end;
     gettimeofday(&start,NULL);
@@ -179,17 +198,17 @@ int main (int argc, char* argv[]) {
       if ((c = getopt(argc, argv, "N:n:I:D:g:t:d:s:r:a:hvFR")) != -1) {
         switch (c) {
           case 'N': {
-            ndim=0;
             if (optarg != NULL) {
-              char *optarg_copy = strdup(optarg);
-              char *token = strtok(optarg_copy, delim);
-              while (token != NULL) {
-                Nsloc[ndim++]=(int)atoi(token);
-                token = strtok(NULL, delim);
-                if (ndim>3){
-                  printf("Too many dimension!");
-                  return 0;
-                }
+              parse_list(optarg, delim, Nsloc, &ndim, 3);
+              // char *optarg_copy = strdup(optarg);
+              // char *token = strtok(optarg_copy, delim);
+              // while (token != NULL) {
+              //   Nsloc[ndim++]=(int)atoi(token);
+              //   token = strtok(NULL, delim);
+              //   if (ndim>3){
+              //     printf("Too many dimension!");
+              //     return 0;
+              //   }
               }
             }
             break;
