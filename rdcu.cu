@@ -8,6 +8,7 @@
 #include "dp45_64.h"
 #include "cublas_v2.h"
 #include <cufft.h>
+#define PI 3.14159265358979323846
 
 typedef struct parameters
 {
@@ -48,12 +49,15 @@ __global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int
     int na=j%Ns[axis];
 
     //multiply by frequency in the specified axis
-    double freq=na*1.0/Ns[axis];
-    if (freq>0.5){
-      freq=freq-1.0;
+    double freq;
+    if (na<Ns[axis]/2){
+      freq=na*2*PI/Ls[axis];
     }
-    Yout[i].x=-freq/Ls[axis]*Yin[i].y;
-    Yout[i].y=freq/Ls[axis]*Yin[i].x;
+    else{
+      freq=(na-Ns[axis])*2*PI/Ls[axis];
+    }
+    Yout[i].x=-freq*Yin[i].y;
+    Yout[i].y=freq*Yin[i].x;
   }
 }
 
@@ -77,7 +81,16 @@ void makeY (double *y, void *pars){
 
 __global__ void add_term (double* f, cufftDoubleComplex* Y, const int N, int eta, double C) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
-  if (i<N){
+  //this is currently only a power of a single index of Y. We'd like to multiple multiple indices.
+  //rethink how to import
+  //each -c can add a list of nonzero exponents and their indices, along with a -C for the coupling constant
+  //we'd probably want a make_term to loop over products in each term
+  //then send the result as Y and add it here.
+  //if we sent all Y here, could also loop over each product terms pow(Y[N*n[j]+i], eta[j]) within this kernel 
+  //if we use i<n*N, we could do this for all fields in a single kernel. We'l loop over nprods for each nterm 
+  // if (i<n*N){
+      // int ifield=i/N;
+  if (i<N){           
       f[i]+=C*pow(Y[i].x,eta);
   }
 }
@@ -207,7 +220,7 @@ int main (int argc, char* argv[]) {
     gettimeofday(&start,NULL);
 
     double t1=1e2, dt=1e0, atl=1e-6, rtl=0, A=1.0;
-    int gpu=0, seed=1, fixed=0, n=1, ndim=0, nterms=0, ndim2=0, nterms2=0, verbose=0, help=1, dense=3, reload=0;
+    int gpu=0, seed=1, fixed=0, n=1, ndim=0, nterms=0, ndim2=0, nterms2=0, verbose=0, help=1, dense=1, reload=0;
     int Nsloc[3]={128,128,128}, cloc[300]={0};
     double Lsloc[3]={1.0,1.0,1.0}, Cloc[100]={0};
     char ch;
@@ -345,17 +358,17 @@ int main (int argc, char* argv[]) {
       printf("Indices for %i fields in %i dimensions:\n", n, ndim);
       int l=0;
       for (int i=0; i<n; i++){
-        printf("%i: y_%i\n",l++,i);
+        printf("%i: u_%i\n",l++,i);
       }
       for(int i=0; i<n; i++){
         for (int j=0; j<ndim; j++){
-          printf("%i: dy_%i/dx_%i\n",l++, i, j);
+          printf("%i: du_%i/dx_%i\n",l++, i, j);
         }
       }
       for(int i=0; i<n; i++){
         for (int j=0; j<ndim; j++){
           for (int k=0; k<ndim; k++){
-              printf("%i: d^2y_%i/dx_%idx_%i\n",l++, i, j, k);
+              printf("%i: d^2u_%i/dx_%idx_%i\n",l++, i, j, k);
           }
         }
       }
