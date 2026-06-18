@@ -1,6 +1,6 @@
 //Zachary G. Nicolaou 6/16/2026
 //nvcc -lcufft -lcublas -O3 -o rdcu dp45_64.cu rdcu.cu
-//./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c 0.8,0,0,2,1,1 -c 0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,10,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c -0.8,1,0,3 -c -0.8,1,0,1,1,2 -v -D3 2dcgle
+//./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c 0.8,0,0,2,1,1 -c 0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c -0.8,1,0,3 -c -0.8,1,0,1,1,2 -v -D3 2dcgle
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -433,7 +433,7 @@ int main (int argc, char* argv[]) {
     char file[256];
     strcpy(file,filebase);
     strcat(file,".out");
-    out = fopen(file,"ab");
+    out = fopen(file,"w");
 
     int *Ns;
     double *yloc, *y, *f, *onesloc, *ones, *term, *Ls;
@@ -482,6 +482,7 @@ int main (int argc, char* argv[]) {
       fprintf(out, "%s ", argv[i]);
     }
     fprintf(out, "\n");
+    fflush(out);
     if (fixed){
       h = dt;
     }
@@ -533,8 +534,8 @@ int main (int argc, char* argv[]) {
       fwrite(&t,sizeof(double),1,in);
       fwrite(&h,sizeof(double),1,in);
       fclose(in);
-
     }
+    fflush(out);
 
     int n0=int(t/dt)+1;
     int n1=int(t1/dt)+1;
