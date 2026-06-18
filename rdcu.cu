@@ -1,5 +1,6 @@
 //Zachary G. Nicolaou 6/16/2026
 //nvcc -lcufft -lcublas -O3 -o rdcu dp45_64.cu rdcu.cu
+//./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c 0.8,0,0,2,1,1 -c 0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,10,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c -0.8,1,0,3 -c -0.8,1,0,1,1,2 -v -D3 2dcgle
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -80,13 +81,12 @@ void makeY (double *y, void *pars){
   cufftExecZ2Z(p->plans[1], p->yfft, p->Y, CUFFT_INVERSE);
   double scale=1.0/p->N;
   cublasDscal(p->handle, 2*p->N*p->n*(1+p->ndim+p->ndim*p->ndim), &scale, (double *)p->Y, 1);
-  //Add the length scales for first and second derivatives too
 }
 
 __global__ void make_term (double* term, cufftDoubleComplex* Y, const int N, int eta) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<N){
-      term[i]*=pow(Y[i].x,eta);
+      term[i]*=pow(Y[i].x,1.0*eta);
   }
 }
 
@@ -99,9 +99,11 @@ void dydt (double t, double *y, double *f, void *pars){
   //add terms
   for (int i=0; i<p->nterms; i++){
     cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+    //accumulate products
     for (int j=1; j<p->nprods[i]; j+=2){
       make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][j]]), p->N, p->c[i][j+1]);
     }
+    //scale and add
     cublasDaxpy(p->handle, p->N, &(p->C[i]), p->term, 1, &(f[p->N*p->c[i][0]]),1);
   }
 
@@ -239,6 +241,8 @@ int main (int argc, char* argv[]) {
     char ch;
     const char delim[] = ",";
     char* filebase;
+    // char **sterms;
+
   
     while (optind < argc) {
       if ((ch = getopt(argc, argv, "hvFRn:N:L:c:A:t:d:s:D:g:r:a:")) != -1) {
@@ -282,11 +286,6 @@ int main (int argc, char* argv[]) {
               c[nterms]=(int *)calloc(100,sizeof(int));
               int chars=fparse_list(optarg, delim, C, &nterms, 1+nterms);
               int plen=parse_list(&(optarg[chars]), delim, c[nterms-1], &(nprods[nterms-1]), 100);
-              printf("Term: %i ", c[nterms-1][0]);
-              for (int i=1; i<nprods[nterms-1]; i++){
-                printf("%i ",c[nterms-1][i]);
-              }
-              printf("\n");
             }
             break;
           }
@@ -371,24 +370,60 @@ int main (int argc, char* argv[]) {
       printf("Indices for %i fields in %i dimensions:\n", n, ndim);
       int l=0;
       for (int i=0; i<n; i++){
-        printf("%i: u_%i\n",l++,i);
+        printf("%i: u%i\n",l++,i);
       }
-      for(int i=0; i<n; i++){
-        for (int j=0; j<ndim; j++){
-          printf("%i: du_%i/dx_%i\n",l++, i, j);
+      for (int j=0; j<ndim; j++){
+        for(int i=0; i<n; i++){
+          printf("%i: u%i_%i\n",l++, i, j);
         }
       }
-      for(int i=0; i<n; i++){
-        for (int j=0; j<ndim; j++){
-          for (int k=0; k<ndim; k++){
-              printf("%i: d^2u_%i/dx_%idx_%i\n",l++, i, j, k);
+      for (int j=0; j<ndim; j++){
+        for (int k=0; k<ndim; k++){
+          for(int i=0; i<n; i++){
+              printf("%i: u%i_%i%i\n",l++, i, j, k);
           }
         }
       }
       exit(0);
     }
+    //length is actually n*(1+ndim+ndim*ndim)
+    char sterms[100][100];    
+    int l=0;
+    for (int i=0; i<n; i++){
+      sprintf(sterms[l++],"u%i",i);
+    }
+    for (int j=0; j<ndim; j++){
+      for(int i=0; i<n; i++){
+        sprintf(sterms[l++],"u%i_%i", i, j);
+      }
+    }
+    for (int j=0; j<ndim; j++){
+      for (int k=0; k<ndim; k++){
+        for(int i=0; i<n; i++){
+            sprintf(sterms[l++],"u%i_%i%i", i, j, k);
+        }
+      }
+    }
+
     if(ndim2<ndim){
       printf("Warning: Number of length scales %i smaller than number of dimensions %i. Using defaults.\n", ndim2, ndim);
+    }
+
+    if(verbose){
+      //print equations
+      for (int k=0; k<n; k++){
+        printf("%s'=",sterms[k]);
+        for (int i=0; i<nterms; i++){
+          if(c[i][0]==k){
+            printf("%.3f",C[i]);
+            for (int j=1; j<nprods[i]; j+=2){
+              printf("(%s)^%i",sterms[c[i][j]], c[i][j+1]);
+            }
+            printf(" + ");
+          }
+        }
+        printf("0\n");
+      }
     }
 
     double t=0,h=1;
