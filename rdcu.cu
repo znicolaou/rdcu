@@ -1,6 +1,6 @@
 //Zachary G. Nicolaou 6/16/2026
 //nvcc -lcufft -lcublas -O3 -o rdcu dp45_64.cu rdcu.cu
-//./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c 0.8,0,0,2,1,1 -c 0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c -0.8,1,0,3 -c -0.8,1,0,1,1,2 -v -D3 2dcgle
+//./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c -0.8,0,0,2,1,1 -c -0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c 0.8,1,0,3 -c 0.8,1,0,1,1,2 -v -D3 2dcgle
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -41,6 +41,7 @@ typedef struct parameters
   cufftDoubleComplex *Yloc;
   char *filebase;
   struct timeval start;
+  FILE *out;
 }parameters;
 
 __global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int N, const int n, int *Ns, double *Ls, const int ndim, const int axis) {
@@ -119,12 +120,12 @@ void step_eval(double t, double h, double* y, void *pars){
     gettimeofday(&end,NULL);
     printf("%.3f\t%1.3e\t%1.3e\t%f\t%i\t\r",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
     fflush(stdout);
-    strcpy(file,p->filebase);
-    strcat(file,".out");
-    FILE *out = fopen(file,"ab");
-    fprintf(out,"%.3f\t%1.3e\t%1.3e\t%f\t%i\t\n",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
-    fflush(out);
-    fclose(out);
+    // strcpy(file,p->filebase);
+    // strcat(file,".out");
+    // FILE *out = fopen(file,"ab");
+    fprintf(p->out,"%.3f\t%1.3e\t%1.3e\t%f\t%i\t\n",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
+    // fflush(out);
+    // fclose(out);
   }
   if(p->dense>=1){
     strcpy(file,p->filebase);
@@ -236,8 +237,8 @@ int main (int argc, char* argv[]) {
 
     double t1=1e2, dt=1e0, atl=1e-6, rtl=0, A=1.0;
     int gpu=0, seed=1, fixed=0, n=1, ndim=0, nterms=0, ndim2=0, verbose=0, help=1, dense=1, reload=0;
-    int Nsloc[3]={128,128,128}, *c[100]={0}, nprods[100]={0};
-    double Lsloc[3]={1.0,1.0,1.0}, C[100]={0};
+    int Nsloc[3]={128,128,128}, *c[1024]={0}, nprods[1024]={0};
+    double Lsloc[3]={1.0,1.0,1.0}, C[1024]={0};
     char ch;
     const char delim[] = ",";
     char* filebase;
@@ -285,7 +286,7 @@ int main (int argc, char* argv[]) {
             if (optarg != NULL) {
               c[nterms]=(int *)calloc(100,sizeof(int));
               int chars=fparse_list(optarg, delim, C, &nterms, 1+nterms);
-              int plen=parse_list(&(optarg[chars]), delim, c[nterms-1], &(nprods[nterms-1]), 100);
+              parse_list(&(optarg[chars]), delim, c[nterms-1], &(nprods[nterms-1]), 1024);
             }
             break;
           }
@@ -387,7 +388,7 @@ int main (int argc, char* argv[]) {
       exit(0);
     }
     //length is actually n*(1+ndim+ndim*ndim)
-    char sterms[100][100];    
+    char sterms[1024][1024];    
     int l=0;
     for (int i=0; i<n; i++){
       sprintf(sterms[l++],"u%i",i);
@@ -409,31 +410,59 @@ int main (int argc, char* argv[]) {
       printf("Warning: Number of length scales %i smaller than number of dimensions %i. Using defaults.\n", ndim2, ndim);
     }
 
+    FILE *out, *in;
+
+    char file[1024];
+    strcpy(file,filebase);
+    strcat(file,".out");
+    out = fopen(file,"w");
+    for (int  i=0; i<argc; i++){
+      fprintf(out, "%s ", argv[i]);
+    }
+    fprintf(out, "\n");
+    fflush(out);
+
+    strcpy(file,filebase);
+    strcat(file, "coupling.dat");
+    if (in = fopen(file,"r")){
+      if (verbose){
+        printf("Using coupling terms from file\n");
+        fprintf(out, "Using coupling terms from file\n");
+      }
+      char line[1024];
+      while(fscanf(in, "%s",line)==1){
+        c[nterms]=(int *)calloc(1024,sizeof(int));
+        int chars=fparse_list(line, delim, C, &nterms, 1+nterms);
+        parse_list(&(line[chars]), delim, c[nterms-1], &(nprods[nterms-1]), 1024);
+      } 
+    }
+    fclose(in);
+
     if(verbose){
       //print equations
       for (int k=0; k<n; k++){
         printf("%s'=",sterms[k]);
+        fprintf(out,"%s'=",sterms[k]);
         for (int i=0; i<nterms; i++){
           if(c[i][0]==k){
             printf("%.3f",C[i]);
+            fprintf(out,"%.3f",C[i]);
             for (int j=1; j<nprods[i]; j+=2){
               printf("(%s)^%i",sterms[c[i][j]], c[i][j+1]);
+              fprintf(out,"(%s)^%i",sterms[c[i][j]], c[i][j+1]);
             }
             printf(" + ");
+            fprintf(out," + ");
           }
         }
         printf("0\n");
+        fprintf(out,"0\n");
       }
     }
 
     double t=0,h=1;
     int i=0,j=0,k=0;
-    FILE *out, *in;
-
-    char file[256];
-    strcpy(file,filebase);
-    strcat(file,".out");
-    out = fopen(file,"w");
+    
 
     int *Ns;
     double *yloc, *y, *f, *onesloc, *ones, *term, *Ls;
@@ -456,7 +485,6 @@ int main (int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
     srand(seed);
-
     cufftPlanMany(&(plans[0]), ndim, Nsloc, Nsloc, 1, N, Nsloc, 1, N, CUFFT_Z2Z, n);
     cufftPlanMany(&(plans[1]), ndim, Nsloc, Nsloc, 1, N, Nsloc, 1, N, CUFFT_Z2Z, n*(1+ndim+ndim*ndim));
 
@@ -476,18 +504,27 @@ int main (int argc, char* argv[]) {
     cudaMalloc ((void**)&yfft, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
     cudaMalloc ((void**)&Y, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
     
-    
     //host vector initialization
-    for (int  i=0; i<argc; i++){
-      fprintf(out, "%s ", argv[i]);
-    }
-    fprintf(out, "\n");
-    fflush(out);
     if (fixed){
       h = dt;
     }
     else{
       h = dt/100;
+    }
+    strcpy(file,filebase);
+    strcat(file, "ic.dat");
+    int loaded=0;
+    if (in = fopen(file,"r")){
+      loaded=1;
+      printf("Using initial conditions from file\n");
+      fprintf(out, "Using initial conditions from file\n");
+      size_t read=fread(yloc,sizeof(double),n*N,in);
+      if (read!=n*N){
+        loaded=0;
+        printf("initial conditions file not compatible with N!\n");
+        fprintf(out,"initial conditions file not compatible with N!\n");
+      }
+      fclose(in);
     }
 
     strcpy(file,filebase);
@@ -495,12 +532,12 @@ int main (int argc, char* argv[]) {
     int reloaded=0;
     if (reload && (in = fopen(file,"r"))){
       reloaded=1;
-      printf("Using initial conditions from file\n");
-      fprintf(out, "Using initial conditions from file\n");
+      printf("Reloading final conditions from file\n");
+      fprintf(out, "Reloading final conditions from file\n");
       size_t read=fread(yloc,sizeof(double),n*N,in);
-      if (read!=N){
-        printf("initial conditions file not compatible with N!\n");
-        fprintf(out,"initial conditions file not compatible with N!\n");
+      if (read!=n*N){
+        printf("final conditions file not compatible with N!\n");
+        fprintf(out,"final conditions file not compatible with N!\n");
         reloaded=0;
       }
       if(reloaded){
@@ -509,7 +546,7 @@ int main (int argc, char* argv[]) {
         if (read!=1){
           printf("Couldn't read start time and step!\n");
           fprintf(out,"Couldn't read start time and step!\n");
-          // reloaded=0;
+          reloaded=0;
         }
       }
       fclose(in);
@@ -517,7 +554,7 @@ int main (int argc, char* argv[]) {
       printf("Restarting at t=%f with h=%f\n",t,h);
       fprintf(out,"Restarting at t=%f with h=%f\n",t,h);
     }
-    if (!reloaded) {
+    if (!reloaded && !loaded) {
       printf("Using random initial conditions\n");
       fprintf(out, "Using random initial conditions\n");
       for(i=0; i<n; i++){
@@ -585,7 +622,8 @@ int main (int argc, char* argv[]) {
       .yloc=yloc,
       .Yloc=Yloc,
       .filebase=filebase,
-      .start=start
+      .start=start,
+      .out=out
     };
     y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
     cudaMemcpy(y, yloc, N*n*sizeof(double), cudaMemcpyHostToDevice);
@@ -644,9 +682,6 @@ int main (int argc, char* argv[]) {
     fflush(outlast);
     fclose(outlast);
 
-    strcpy(file,filebase);
-    strcat(file,".out");
-    out = fopen(file,"ab");
     gettimeofday(&end,NULL);
     printf("\nruntime: %f\n",end.tv_sec-start.tv_sec + 1e-6*(end.tv_usec-start.tv_usec));
     fprintf(out,"\nsteps: %i\n",pars.steps);
