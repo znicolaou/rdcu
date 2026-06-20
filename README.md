@@ -20,7 +20,7 @@ $$
 
 is the collection of the fields and their spatial derivatives up to second order.
 
-The integration will be carried out with cuda on a GPU using the 4/5 Dormand-Prince Runge Kutta method, with adaptive timestepping, based on code from https://github.com/znicolaou/kuramoto_dmd. (n.b. it would be good to implement an adaptive BDF method for stiff systems as well)
+The integration is performed on a GPU using CUDA, employing the 4/5 Dormand-Prince Runge-Kutta method with adaptive timestepping, based on code from https://github.com/znicolaou/kuramoto_dmd. (n.b. it would be good to implement an adaptive BDF method for stiff systems as well)
 
 ## Usage
 Compile with
