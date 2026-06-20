@@ -27,8 +27,6 @@ Compile with
 ```
 nvcc -lcublas -lcufft -O3 -o rdcu dp45_64.cu rdcu.cu
 ```
-The code is only partially completed.
-
 Running `./rdcu -h` produces the following message:
 ```
 usage:	rdcu [-hvFR] [-n NFIELDS] [-N NUMS] [-L LENGTHS]
@@ -49,7 +47,8 @@ COUPLING is a list of coupling terms, separated by commas (no spaces). Default e
 	Factor indices for the given -n and -N values appear below. 
 	You may specify additional coupling terms on separate lines in this format in the input file FILEBASEcoupling.dat. 
 AMPLITUDE is uniform random initial condition amplitude. Default 1.0 
-	You may also provide a binary input file FILEBASEic.dat with the initial conditionTIME is total integration time. Default 1e2 
+	You may also provide a binary input file FILEBASEic.dat with the initial condition
+TIME is total integration time. Default 1e2 
 DT is the time between outputs. Default 1e0 
 SEED is random seed. Default 1 
 GPU is index of the gpu. Default 0
@@ -60,7 +59,11 @@ RTOL is relative error tolerance. Default 1E-6
 ATOL is absolute error tolerance. Default 1E-6
 FILEBASE is base file name for output. 
 
-Example: ./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c -0.8,0,0,2,1,1 -c -0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c 0.8,1,0,3 -c 0.8,1,0,1,1,2 -v -D3 2dcgle
+Example:
+./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 \
+-c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c -0.8,0,0,2,1,1 \
+-c -0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 \
+-c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c 0.8,1,0,3 -c 0.8,1,0,1,1,2 -v 2dcgle
 
 Indices for 1 field(s) in 1 dimension(s):
 0: u0
