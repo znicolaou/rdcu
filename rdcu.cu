@@ -9,6 +9,7 @@
 #include "dp45_64.h"
 #include "cublas_v2.h"
 #include <cufft.h>
+#include <cusparse.h>
 #define PI 3.14159265358979323846
 
 typedef struct parameters
@@ -25,6 +26,9 @@ typedef struct parameters
   double *f;
   cufftDoubleComplex *Y;
   cufftDoubleComplex *yfft;
+  int *cols;
+  int *rows;
+  double *vals;
   int **c;
   int *nprods;
   double *C;
@@ -34,6 +38,7 @@ typedef struct parameters
   int steps;
   int verbose;
   int dense;
+  int stiff;
   double *t_eval;
   int n_eval;
   int eval_i;
@@ -71,69 +76,6 @@ __global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int
   }
 }
 
-//For finite difference Jacobian, we need to calculate dY 
-//the rowinds and colinds for the first and second order derivatives have 2N and 3N terms, respectively
-//We can initialize 3*N*len(Y) inds corresponding to -1,0,+1 for each Y
-//we can find these on the host 
-
-void dydt (double t, double *y, double *f, void *pars){
-  parameters *p = (parameters *)pars;
-  makeY(y, pars);
-  //zero out f
-  double zero=0.0;
-  cublasDscal(p->handle, p->N*p->n, &zero, f, 1);
-  //add terms
-  for (int i=0; i<p->nterms; i++){
-    cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
-    //accumulate products
-    for (int j=1; j<p->nprods[i]; j+=2){
-      make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][j]]), p->N, p->c[i][j+1]);
-    }
-    //scale and add
-    cublasDaxpy(p->handle, p->N, &(p->C[i]), p->term, 1, &(f[p->N*p->c[i][0]]),1);
-  }
-}
-
-void jac (double t, double *y, cusparseSpMatDescr_t *J, void *pars){
-  parameters *p = (parameters *)pars;
-  makeY(y, pars);  //necessary? will dydt always be called first?
-  //zero out J and make temporary term sparse matrix
-  double zero=0.0;
-  cusparseSpMatDescr_t *termdesc;
-  // cublasDscal(p->handle, p->N*p->n, &zero, f, 1);
-  //add terms
-  for (int i=0; i<p->nterms; i++){
-    //chain rule for each term 
-    for (int j=0; j<p->nprods[i]; j+=2){
-      cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
-      //product of powers
-      for (int k=0; k<p->nprods[i]; k+=2){
-        int pow=p->c[i][k+1];
-        if (k==j){
-          pow--;
-          //multiply by the current derivative power and term coefficient
-          cublasDaxpy(p->handle, p->N, &(p->C[i]*pow), p->term, 1, p->term,1);
-        }
-        make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][k]]), p->N, pow);
-      }`
-
-      //copy vals of dY/dj and multiply by the corresponding term 
-      cudaMemcpy(valstemp, p->vals[3*p->N*c[i][j]], 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(rowstemp, p->rows[3*p->N*c[i][j]], 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(colstemp, p->cols[3*p->N*c[i][j]], 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
-      coloffset=p->N*p->c[i][0];
-      rowoffset=p->N*(p->c[i][j]%p->nterms);
-      make_jac_term<<<(p->3*N+255)/256, 256>>>(valstemp, rowstemp, colstemp, p->term, p->N*p->n, coloffset, rowoffset);
-
-      //create a sparse matrix for the term
-      cusparseCreateCoo(termdesc,p->n*p->N,p->n*p->N,3*p->N,rowstemp,colstemp,valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
-      //add to the jacobian; J=J+term*dY/dj
-      //convert to CSR
-    }
-  }
-}
-
-
 __global__ void make_term (double* term, cufftDoubleComplex* Y, const int N, int eta) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<N){
@@ -141,14 +83,15 @@ __global__ void make_term (double* term, cufftDoubleComplex* Y, const int N, int
   }
 }
 
-__global__ void make_jac_term (double* vals, double* rows, double* cols, cufftDoubleComplex* term, const int N, int coloffset, int rowoffset) {
+__global__ void make_jac_term (double* vals, int* rows, int* cols, double* term, const int N, int coloffset, int rowoffset) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<3*N){
-    vals[i]*=term[rows[i]];
+    vals[i]*=(term[rows[i]]);
     rows[i]+=rowoffset;
     cols[i]+=coloffset;
   }
 }
+
 
 void makeY (double *y, void *pars){
   parameters *p = (parameters *)pars;
@@ -189,6 +132,60 @@ void dydt (double t, double *y, double *f, void *pars){
     }
     //scale and add
     cublasDaxpy(p->handle, p->N, &(p->C[i]), p->term, 1, &(f[p->N*p->c[i][0]]),1);
+  }
+}
+
+void jac (double t, double *y, cusparseSpMatDescr_t *Jdesc, void *pars){
+  parameters *p = (parameters *)pars;
+  makeY(y, pars);  //necessary? will dydt always be called first?
+  //zero out J and make temporary term sparse matrix
+  double zero=0.0;
+  cusparseSpMatDescr_t *termdesc;
+  // cublasDscal(p->handle, p->N*p->n, &zero, f, 1);
+  //add terms
+  for (int i=0; i<p->nterms; i++){
+    //chain rule for each term 
+    for (int j=0; j<p->nprods[i]; j+=2){
+      cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      //product of powers
+      for (int k=0; k<p->nprods[i]; k+=2){
+        int pow=p->c[i][k+1];
+        if (k==j){
+          pow--;
+          //multiply by the current derivative power and term coefficient
+          double coeff=p->C[i]*pow;
+          cublasDaxpy(p->handle, p->N, &(coeff), p->term, 1, p->term,1);
+        }
+        make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][k]]), p->N, pow);
+      }
+
+      //copy vals of dY/dj and multiply by the corresponding term 
+      cudaMemcpy(valstemp, &(p->vals[3*p->N*p->c[i][j]]), 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(rowstemp, &(p->rows[3*p->N*p->c[i][j]]), 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(colstemp, &(p->cols[3*p->N*p->c[i][j]]), 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      int coloffset=p->N*p->c[i][0];
+      int rowoffset=p->N*(p->c[i][j]%p->nterms);
+      make_jac_term<<<(3*p->N+255)/256, 256>>>(valstemp, rowstemp, colstemp, p->term, p->N*p->n, coloffset, rowoffset);
+
+      //create a sparse matrix for the term
+      // cusparseCreateCoo(termdesc,p->n*p->N,p->n*p->N,3*p->N,p->rowstemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
+      //convert to csr
+      cusparseDcoo2csr(p->sphandle, p->rowoffettemp, 3*p->N, p->n*p->N, p->rowstemp, CUSPARSE_INDEX_BASE_ZERO);
+      cusparseCreateCsr(termdesc,p->n*p->N,p->n*p->N,3*p->N,p->csrrwostemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
+      size_t bufferSize = 0;
+      void* buffer = NULL;
+      //Add to J and store in Jtemp
+      cusparseSpGEAM_bufferSize(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,&bufferSize);
+      cudaMalloc(&externalBuffer, bufferSizeInBytes);
+      cusparseSpGEAM(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
+      cusparseSpGEAM(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
+
+      //copy vals, rows, and cols from Jtemp to 
+      //Destroy the J descriptor and c
+
+      cusparseDestroySpMat(matA);
+
+    }
   }
 }
 
