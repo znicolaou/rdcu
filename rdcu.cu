@@ -168,22 +168,32 @@ void jac (double t, double *y, cusparseSpMatDescr_t *Jdesc, void *pars){
       make_jac_term<<<(3*p->N+255)/256, 256>>>(valstemp, rowstemp, colstemp, p->term, p->N*p->n, coloffset, rowoffset);
 
       //create a sparse matrix for the term
-      // cusparseCreateCoo(termdesc,p->n*p->N,p->n*p->N,3*p->N,p->rowstemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
       //convert to csr
-      cusparseDcoo2csr(p->sphandle, p->rowoffettemp, 3*p->N, p->n*p->N, p->rowstemp, CUSPARSE_INDEX_BASE_ZERO);
-      cusparseCreateCsr(termdesc,p->n*p->N,p->n*p->N,3*p->N,p->csrrwostemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
+      cusparseDcoo2csr(p->sphandle, p->crowstemp, 3*p->N, p->n*p->N, p->rowstemp, CUSPARSE_INDEX_BASE_ZERO);
+      cusparseCreateCsr(termdesc,p->n*p->N,p->n*p->N,3*p->N,p->crowstemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
       size_t bufferSize = 0;
       void* buffer = NULL;
-      //Add to J and store in Jtemp
+      cusparseSpGEAMDescr_t* spgeamDescr;
+      cusparseSpGEAM_createDescr(spgeamDescr);
+
+      //Add to J
+      size_t nnz=0;
+      cusparseCreateCsr(Jtempdesc,p->n*p->N,p->n*p->N,&nnz,p->crowstemp2,p->colstemp2,p->valstemp2,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
       cusparseSpGEAM_bufferSize(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,&bufferSize);
-      cudaMalloc(&externalBuffer, bufferSizeInBytes);
+      cudaMalloc(&buffer, bufferSizeInBytes);
+      cusparseSpGEAM_nnz(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
+      cusparseSpMatGetSize(Jtempdesc, NULL, NULL, &nnz);
       cusparseSpGEAM(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
-      cusparseSpGEAM(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
+      cusparseSpGEAM_destroyDescr(spgeamDescr);
+      cudaFree(&buffer);
+      cudaMemcpy(p->Jrows, p->crowstemp2, p->n*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(p->Jcols, p->colstemp2, nnz*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(p->Jvals, p->valstemp2, nnz*sizeof(double), cudaMemcpyDeviceToDevice);
+      cusparseDestroySpMat(Jdesc);
+      cusparseDestroySpMat(termdesc);
+      cusparseDestroySpMat(Jtempdesc);
 
-      //copy vals, rows, and cols from Jtemp to 
-      //Destroy the J descriptor and c
-
-      cusparseDestroySpMat(matA);
+      cusparseCreateCsr(Jdesc,p->n*p->N,p->n*p->N,nnz,p->crowstemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
 
     }
   }
