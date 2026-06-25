@@ -71,6 +71,69 @@ __global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int
   }
 }
 
+//For finite difference Jacobian, we need to calculate dY 
+//the rowinds and colinds for the first and second order derivatives have 2N and 3N terms, respectively
+//We can initialize 3*N*len(Y) inds corresponding to -1,0,+1 for each Y
+//we can find these on the host 
+
+void dydt (double t, double *y, double *f, void *pars){
+  parameters *p = (parameters *)pars;
+  makeY(y, pars);
+  //zero out f
+  double zero=0.0;
+  cublasDscal(p->handle, p->N*p->n, &zero, f, 1);
+  //add terms
+  for (int i=0; i<p->nterms; i++){
+    cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+    //accumulate products
+    for (int j=1; j<p->nprods[i]; j+=2){
+      make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][j]]), p->N, p->c[i][j+1]);
+    }
+    //scale and add
+    cublasDaxpy(p->handle, p->N, &(p->C[i]), p->term, 1, &(f[p->N*p->c[i][0]]),1);
+  }
+}
+
+void jac (double t, double *y, cusparseSpMatDescr_t *J, void *pars){
+  parameters *p = (parameters *)pars;
+  makeY(y, pars);  //necessary? will dydt always be called first?
+  //zero out J and make temporary term sparse matrix
+  double zero=0.0;
+  cusparseSpMatDescr_t *termdesc;
+  // cublasDscal(p->handle, p->N*p->n, &zero, f, 1);
+  //add terms
+  for (int i=0; i<p->nterms; i++){
+    //chain rule for each term 
+    for (int j=0; j<p->nprods[i]; j+=2){
+      cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      //product of powers
+      for (int k=0; k<p->nprods[i]; k+=2){
+        int pow=p->c[i][k+1];
+        if (k==j){
+          pow--;
+          //multiply by the current derivative power and term coefficient
+          cublasDaxpy(p->handle, p->N, &(p->C[i]*pow), p->term, 1, p->term,1);
+        }
+        make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][k]]), p->N, pow);
+      }`
+
+      //copy vals of dY/dj and multiply by the corresponding term 
+      cudaMemcpy(valstemp, p->vals[3*p->N*c[i][j]], 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(rowstemp, p->rows[3*p->N*c[i][j]], 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(colstemp, p->cols[3*p->N*c[i][j]], 3*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+      coloffset=p->N*p->c[i][0];
+      rowoffset=p->N*(p->c[i][j]%p->nterms);
+      make_jac_term<<<(p->3*N+255)/256, 256>>>(valstemp, rowstemp, colstemp, p->term, p->N*p->n, coloffset, rowoffset);
+
+      //create a sparse matrix for the term
+      cusparseCreateCoo(termdesc,p->n*p->N,p->n*p->N,3*p->N,rowstemp,colstemp,valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
+      //add to the jacobian; J=J+term*dY/dj
+      //convert to CSR
+    }
+  }
+}
+
+
 __global__ void make_term (double* term, cufftDoubleComplex* Y, const int N, int eta) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i<N){
@@ -78,21 +141,37 @@ __global__ void make_term (double* term, cufftDoubleComplex* Y, const int N, int
   }
 }
 
+__global__ void make_jac_term (double* vals, double* rows, double* cols, cufftDoubleComplex* term, const int N, int coloffset, int rowoffset) {
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i<3*N){
+    vals[i]*=term[rows[i]];
+    rows[i]+=rowoffset;
+    cols[i]+=coloffset;
+  }
+}
+
 void makeY (double *y, void *pars){
   parameters *p = (parameters *)pars;
   cublasDcopy(p->handle, p->N*p->n, y, 1, (double *)(p->Y), 2);
 
-  cufftExecZ2Z(p->plans[0], p->Y, p->yfft, CUFFT_FORWARD);
-  //in principle, we could track which derivatives are necessary and only calculate those
-  for (int i=0; i<p->ndim; i++){
-    d1<<<(p->N*p->n+255)/256, 256>>>(p->yfft, &(p->yfft[(i+1)*p->N*p->n]), p->N, p->n, p->Ns, p->Ls, p->ndim, i);
-    for (int j=0; j<p->ndim; j++){
-      d1<<<(p->N*p->n+255)/256, 256>>>(&(p->yfft[(i+1)*p->N*p->n]), &(p->yfft[(j+i*p->ndim+p->ndim+1)*p->N*p->n]), p->N, p->n, p->Ns, p->Ls, p->ndim, j);
-    }
+  if(p->stiff){
+    //find finite differences
   }
-  cufftExecZ2Z(p->plans[1], p->yfft, p->Y, CUFFT_INVERSE);
-  double scale=1.0/p->N;
-  cublasDscal(p->handle, 2*p->N*p->n*(1+p->ndim+p->ndim*p->ndim), &scale, (double *)p->Y, 1);
+
+  else{
+    //pseudospectral
+    cufftExecZ2Z(p->plans[0], p->Y, p->yfft, CUFFT_FORWARD);
+    //in principle, we could track which derivatives are necessary and only calculate those
+    for (int i=0; i<p->ndim; i++){
+      d1<<<(p->N*p->n+255)/256, 256>>>(p->yfft, &(p->yfft[(i+1)*p->N*p->n]), p->N, p->n, p->Ns, p->Ls, p->ndim, i);
+      for (int j=0; j<p->ndim; j++){
+        d1<<<(p->N*p->n+255)/256, 256>>>(&(p->yfft[(i+1)*p->N*p->n]), &(p->yfft[(j+i*p->ndim+p->ndim+1)*p->N*p->n]), p->N, p->n, p->Ns, p->Ls, p->ndim, j);
+      }
+    }
+    cufftExecZ2Z(p->plans[1], p->yfft, p->Y, CUFFT_INVERSE);
+    double scale=1.0/p->N;
+    cublasDscal(p->handle, 2*p->N*p->n*(1+p->ndim+p->ndim*p->ndim), &scale, (double *)p->Y, 1);
+  }
 }
 
 void dydt (double t, double *y, double *f, void *pars){
@@ -207,7 +286,7 @@ int main (int argc, char* argv[]) {
     gettimeofday(&start,NULL);
 
     double t1=1e2, dt=1e0, atl=1e-6, rtl=0, A=1.0;
-    int gpu=0, seed=1, fixed=0, n=1, ndim=1, nterms=0, ndim2=0, verbose=0, help=1, dense=1, reload=0;
+    int gpu=0, seed=1, fixed=0, n=1, ndim=1, nterms=0, ndim2=0, verbose=0, help=1, dense=1, stiff=0, reload=0;
     int Nsloc[3]={128,128,128}, *c[1024]={0}, nprods[1024]={0};
     double Lsloc[3]={1.0,1.0,1.0}, C[1024]={0};
     char ch;
@@ -215,7 +294,7 @@ int main (int argc, char* argv[]) {
     char* filebase;
   
     while (optind < argc) {
-      if ((ch = getopt(argc, argv, "hvFRn:N:L:c:A:t:d:s:D:g:r:a:")) != -1) {
+      if ((ch = getopt(argc, argv, "hvFRSn:N:L:c:A:t:d:s:D:g:r:a:")) != -1) {
         switch (ch) {
           case 'h': {
             help=1;
@@ -231,6 +310,10 @@ int main (int argc, char* argv[]) {
           }
           case 'R': {
             reload = 1;
+            break;
+          }
+          case 'S': {
+            stiff = 1;
             break;
           }
           case 'n': {
