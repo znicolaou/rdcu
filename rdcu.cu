@@ -173,12 +173,12 @@ void jac (double t, double *y, int *nnz, int *Jrows, int *Jcols, double *Jvals, 
       }
 
       //copy vals of dY/dj and multiply by the corresponding term 
-      int nnzterm=(p->dYnnz[p->c[i][j]]);
-      cudaMemcpy(p->valstemp, (p->dYvals[p->c[i][j]]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(p->rowstemp, (p->dYrows[p->c[i][j]]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(p->colstemp, (p->dYcols[p->c[i][j]]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
+      int nnzterm=(p->dYnnz[p->c[i][j]/p->n]);
+      cudaMemcpy(p->valstemp, (p->dYvals[p->c[i][j]/p->n]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(p->rowstemp, (p->dYrows[p->c[i][j]/p->n]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(p->colstemp, (p->dYcols[p->c[i][j]/p->n]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
       int coloffset=p->N*p->c[i][0];
-      int rowoffset=p->N*(p->c[i][j]%p->nterms);
+      int rowoffset=p->N*(p->c[i][j]%p->n);
       make_jac_term<<<(nnzterm+255)/256, 256>>>(p->valstemp, p->rowstemp2, p->colstemp, p->term, p->N*p->n, coloffset, rowoffset);
 
       //create a sparse matrix for the term
@@ -594,84 +594,96 @@ int main (int argc, char* argv[]) {
     }
     else{
       //lists of finite difference coefficients
+      dYnnzloc = (int *)calloc((1+ndim+ndim*ndim),sizeof(int));
       dYrowsloc = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
       dYcolsloc = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
       dYvalsloc = (double **)calloc((1+ndim+ndim*ndim),sizeof(double *));
       int Yind=0;
-      for (i=0; i<nterms; i++){
-        dYnnz[Yind]=N;
-        dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(N,sizeof(int));
-        dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(N,sizeof(int));
-        dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(N,sizeof(double));
+      dYnnz[Yind]=N;
+      dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(N,sizeof(int));
+      dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(N,sizeof(int));
+      dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(N,sizeof(double));
+      for (j=0; j<N; j++){
+        dYcolsloc[dYnnzloc[Yind]][j]=j;
+        dYrowsloc[dYnnzloc[Yind]][j]=j;
+        dYvalsloc[dYnnzloc[Yind]][j]=1.0;
+      }
+      Yind++;
+      for (axis=0; axis<ndim; axis++){
+        dYnnz[Yind]=2*N;
+        dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(2*N,sizeof(int));
+        dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(2*N,sizeof(int));
+        dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(2*N,sizeof(double));
         for (j=0; j<N; j++){
-          dYcolsloc[dYnnzloc[Yind]][j]=j;
-          dYrowsloc[dYnnzloc[Yind]][j]=j;
-          dYvalsloc[dYnnzloc[Yind]][j]=1.0;
+          int stride =1;
+          //unravel
+          for (int d=ndim-1; d>axis; d--){
+            stride *= Ns[d];
+          }
+          int na=(j/stride)%Ns[axis];
+          double scale=Ls[axis]/Ns[axis];
+          dYrowsloc[dYnnzloc[Yind]][2*j]=j;
+          dYcolsloc[dYnnzloc[Yind]][2*j]=stride+((Ns[axis]+na-1)%Ns[axis]);
+          dYvalsloc[dYnnzloc[Yind]][2*j]=1.0/scale;
+          dYrowsloc[dYnnzloc[Yind]][2*j+1]=j;
+          dYcolsloc[dYnnzloc[Yind]][2*j+1]=stride+((Ns[axis]+na-1)%Ns[axis]);
+          dYvalsloc[dYnnzloc[Yind]][2*j+1]=-1.0/scale;
         }
         Yind++;
-      }
-      for (i=0; i<nterms; i++){
-        for (axis=0; axis<ndim; axis++){
-          dYnnz[Yind]=2*N;
-          dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(2*N,sizeof(int));
-          dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(2*N,sizeof(int));
-          dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(2*N,sizeof(double));
+        for (axis2=0; axis2<ndim; axis2++){
+          if (axis==axis2)
+            dYnnz[Yind]=3*N;
+          else
+            dYnnz[Yind]=4*N;
+          dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(dYnnzloc[Yind],sizeof(int));
+          dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(dYnnzloc[Yind],sizeof(int));
+          dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(dYnnzloc[Yind],sizeof(double));
           for (j=0; j<N; j++){
+            //unravel first axis
             int stride =1;
-            //unravel
             for (int d=ndim-1; d>axis; d--){
               stride *= Ns[d];
             }
             int na=(j/stride)%Ns[axis];
-            double scale=Ls[axis]/Ns[axis];
-            dYrowsloc[dYnnzloc[Yind]][2*j]=j;
-            dYcolsloc[dYnnzloc[Yind]][2*j]=stride+((N+na-1)%N);
-            dYvalsloc[dYnnzloc[Yind]][2*j]=1.0/scale;
-            dYrowsloc[dYnnzloc[Yind]][2*j+1]=j;
-            dYcolsloc[dYnnzloc[Yind]][2*j+1]=stride+((N+na-1)%N);
-            dYvalsloc[dYnnzloc[Yind]][2*j+1]=-1.0/scale;
-          }
-          Yind++;
-          for (axis2=0; axis2<ndim; axis2++){
-            if (axis==axis2)
-              dYnnz[Yind]=3*N;
-            else
-              dYnnz[Yind]=5*N;
-            dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(dYnnzloc[Yind],sizeof(int));
-            dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(dYnnzloc[Yind],sizeof(int));
-            dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(dYnnzloc[Yind],sizeof(double));
-            for (j=0; j<N; j++){
-              int stride =1;
-              //unravel
-              for (int d=ndim-1; d>axis; d--){
-                stride *= Ns[d];
-              }
-              int na=(j/stride)%Ns[axis];
-              double scale=1.0/(Ls[axis]/Ns[axis])/(Ls[axis2]/Ns[axis2]);
+            int jp=stride+((N+na+1)%Ns[axis]);
+            int jm=stride+((N+na-1)%Ns[axis]);
+
+            //unravel second axis
+            int stride2 =1;
+            for (int d=ndim-1; d>axis2; d--){
+              stride2 *= Ns[d];
+            }
+
+            int nap=(jp/stride2)%Ns[axis];
+            int nam=(jm/stride2)%Ns[axis];
+            double scale=1.0/(Ls[axis]/Ns[axis])/(Ls[axis2]/Ns[axis2]);
+
+            if(axis==axis2){
               dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=j;
               dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=j;
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=-1.0*(dYnnz[Yind]-1)/scale;
+              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=-2.0/scale;
               dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=stride+((N+na+1)%N);
+              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=jp;
               dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=1.0/scale;
               dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=stride+((N+na-1)%N);
+              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=jm;
               dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=1.0/scale;
-              if (axis!=axis2){
-                stride =1;
-                //unravel second axis
-                for (int d=ndim-1; d>axis2; d--){
-                  stride *= Ns[d];
-                }
-                na=(j/stride)%Ns[axis];
-                dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=j;
-                dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=stride+((N+na+1)%N);
-                dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=1.0/scale;
-                dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+4]=j;
-                dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+4]=stride+((N+na-1)%N);
-                dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+4]=1.0/scale;
-              }
             }
+            else{
+              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=j;
+              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=stride2+((Ns[axis2]+nap+1)%Ns[axis2]);
+              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=1.0/scale;
+              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=j;
+              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=stride2+((Ns[axis2]+nam+1)%Ns[axis2]);
+              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=-1.0/scale;
+              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=j;
+              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=stride2+((Ns[axis2]+nap-1)%Ns[axis2]);
+              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=-1.0/scale;
+              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=j;
+              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=stride2+((Ns[axis2]+nam-1)%Ns[axis2]);
+              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=1.0/scale;
+            }
+            Yind++;
           }
         }
         //copy everything to device
