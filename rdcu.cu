@@ -107,13 +107,7 @@ void makeY (double *y, void *pars){
   double one=1.0, zero=0.0;
   if(p->stiff){
     //find finite differences, can use sparse vector multiplication
-    cusparseDnVecDescr_t *dy,*dY;
-    dy=
-    for (int Yind=1; Yind<1+p->ndim+p->ndim*p->ndim; Yind++){
-      for(int i=0; i<p->n; i++){
 
-      }
-    }
     for (int Yind=1; Yind<1+p->ndim+p->ndim*p->ndim; Yind++){
       for(int i=0; i<p->n; i++){
         printf("makeY\n");
@@ -122,7 +116,6 @@ void makeY (double *y, void *pars){
         //store in p->Y[p->n*Yind+i] (cast to double* and use a output stride of 2)
         cusparseSpMatDescr_t J;
         cusparseDnVecDescr_t dy,dY;
-        // cudaMemcpy(test, p->dYnnz[Yind], p->N*sizeof(double), cudaMemcpyDeviceToDevice);
         cusparseCreateCoo(&J, p->N, p->N, p->dYnnz[Yind], p->dYrows[Yind], p->dYcols[Yind], p->dYvals[Yind],CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
         cusparseCreateDnVec(&dy, p->N, &(y[p->N*i]), CUDA_R_64F);
         cusparseCreateDnVec(&dY, p->N, (double *)(&(p->yfft)), CUDA_R_64F);
@@ -131,11 +124,11 @@ void makeY (double *y, void *pars){
         size_t *buffer=NULL;
         cudaMalloc(&buffer, buffersize);
         cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one,J,dy,&zero,dY,CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, buffer);
-        cublasDcopy(p->handle, p->N*p->n, (double *)p->yfft, 1, (double *)(&(p->Y[p->n*Yind+i])), 2);
+        cublasDcopy(p->handle, p->N, (double *)p->yfft, 1, (double *)(&(p->Y[p->n*Yind+i])), 2);
         //maybe i should have a list of dnvecs that we can keep
-        // cusparseDestroyDnVec(dy);
-        // cusparseDestroyDnVec(dY);
-        // cusparseDestroySpMat(J);
+        cusparseDestroyDnVec(dy);
+        cusparseDestroyDnVec(dY);
+        cusparseDestroySpMat(J);
         cudaFree(buffer); //we could store these in p and reuse them
       }
     }
