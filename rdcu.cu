@@ -107,22 +107,35 @@ void makeY (double *y, void *pars){
   double one=1.0, zero=0.0;
   if(p->stiff){
     //find finite differences, can use sparse vector multiplication
+    cusparseDnVecDescr_t *dy,*dY;
+    dy=
     for (int Yind=1; Yind<1+p->ndim+p->ndim*p->ndim; Yind++){
       for(int i=0; i<p->n; i++){
+
+      }
+    }
+    for (int Yind=1; Yind<1+p->ndim+p->ndim*p->ndim; Yind++){
+      for(int i=0; i<p->n; i++){
+        printf("makeY\n");
+        fflush(stdout);
         //create sparse matrix pointing to dY[Yind], and do sparse matrix dense vector multiplication with &(y[N*i])
         //store in p->Y[p->n*Yind+i] (cast to double* and use a output stride of 2)
-        cusparseSpMatDescr_t dY;
-        cusparseDnVecDescr_t x,y;
-        cusparseCreateCoo(&dY, p->N, p->N, p->dYnnz[Yind], p->dYrows[i], p->dYcols[i], p->dYvals[i],CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
-        cusparseCreateDnVec(&x, p->N, &(p->y[N*i]), CUDA_R_64F);
-        cusparseCreateDnVec(&x, p->N, (double *)(&(p->yfft)), CUDA_R_64F);
-        int buffersize=NULL;
-        cusparseSpMV_bufferSize(p->handle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one, dY, x, &zero, y, CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
-        int *buffer=cudaMalloc(&buffer, bufferSize);
-        cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one,dY,x,&zero,y,CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, NULL);
-        cublasDcopy(p->handle, p->N*p->n, valstemp, 1, (double *)(&(p->Y[p->n*Yind+1])), 2);
-        cusparseDestroyDnVec(x);
-        cusparseDestroyDnVec(y);
+        cusparseSpMatDescr_t J;
+        cusparseDnVecDescr_t dy,dY;
+        // cudaMemcpy(test, p->dYnnz[Yind], p->N*sizeof(double), cudaMemcpyDeviceToDevice);
+        cusparseCreateCoo(&J, p->N, p->N, p->dYnnz[Yind], p->dYrows[Yind], p->dYcols[Yind], p->dYvals[Yind],CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
+        cusparseCreateDnVec(&dy, p->N, &(y[p->N*i]), CUDA_R_64F);
+        cusparseCreateDnVec(&dY, p->N, (double *)(&(p->yfft)), CUDA_R_64F);
+        size_t buffersize=0;
+        cusparseSpMV_bufferSize(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one, J, dy, &zero, dY, CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, &buffersize);
+        size_t *buffer=NULL;
+        cudaMalloc(&buffer, buffersize);
+        cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one,J,dy,&zero,dY,CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, buffer);
+        cublasDcopy(p->handle, p->N*p->n, (double *)p->yfft, 1, (double *)(&(p->Y[p->n*Yind+i])), 2);
+        //maybe i should have a list of dnvecs that we can keep
+        // cusparseDestroyDnVec(dy);
+        // cusparseDestroyDnVec(dY);
+        // cusparseDestroySpMat(J);
         cudaFree(buffer); //we could store these in p and reuse them
       }
     }
@@ -572,7 +585,7 @@ int main (int argc, char* argv[]) {
     int i=0,j=0,k=0,axis=0,axis2=0;
     int *Ns;
     double *yloc, *y, *f, *onesloc, *ones, *term, *Ls;
-    int *rowstemp, *rowstemp2, *colstemp, *colstemp2, **dYrowsloc, **dYcolsloc, **dYrows, **dYcols, *dYnnz, *dYnnzloc;
+    int *rowstemp, *rowstemp2, *colstemp, *colstemp2, **dYrowsloc, **dYcolsloc, **dYrows, **dYcols, *dYnnz;
     double *valstemp, *valstemp2, **dYvalsloc, **dYvals;
     cufftDoubleComplex *Yloc, *Y, *yfftloc, *yfft;
     int N=Nsloc[0];
@@ -582,15 +595,19 @@ int main (int argc, char* argv[]) {
 
     //cuda handles and plans
     cublasStatus_t stat;
+    cusparseStatus_t spstat;
     cublasHandle_t handle;
+    cusparseHandle_t sphandle;
     cufftHandle *plans = (cufftHandle*) malloc(2 * sizeof(cufftHandle));
     cudaSetDevice(gpu);
     stat = cublasCreate(&handle);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
+    spstat = cusparseCreate(&sphandle);
+    if (stat != CUBLAS_STATUS_SUCCESS || spstat != CUSPARSE_STATUS_SUCCESS) {
         printf ("CUBLAS initialization failed\n");
         fprintf (out,"CUBLAS initialization failed\n");
         return EXIT_FAILURE;
     }
+
     srand(seed);
     cufftPlanMany(&(plans[0]), ndim, Nsloc, Nsloc, 1, N, Nsloc, 1, N, CUFFT_Z2Z, n);
     cufftPlanMany(&(plans[1]), ndim, Nsloc, Nsloc, 1, N, Nsloc, 1, N, CUFFT_Z2Z, n*(1+ndim+ndim*ndim));
@@ -608,126 +625,199 @@ int main (int argc, char* argv[]) {
     cudaMalloc ((void**)&f, N*n*sizeof(double));
     cudaMalloc ((void**)&term, N*sizeof(double));
     cudaMalloc ((void**)&ones, N*sizeof(double));
-    if (!stiff){
-      cudaMalloc ((void**)&yfft, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
-      cudaMalloc ((void**)&Y, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
-    }
-    else{
+    cudaMalloc ((void**)&yfft, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
+    cudaMalloc ((void**)&Y, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
+
+    if(stiff){
       //lists of finite difference coefficients
-      dYnnzloc = (int *)calloc((1+ndim+ndim*ndim),sizeof(int));
+      int *ns = (int*)calloc(ndim,sizeof(int));
+      dYnnz = (int *)calloc((1+ndim+ndim*ndim),sizeof(int));
+      dYrows = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
+      dYcols = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
+      dYvals = (double **)calloc((1+ndim+ndim*ndim),sizeof(double *));
       dYrowsloc = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
       dYcolsloc = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
       dYvalsloc = (double **)calloc((1+ndim+ndim*ndim),sizeof(double *));
+      
       int Yind=0;
       dYnnz[Yind]=N;
-      dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(N,sizeof(int));
-      dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(N,sizeof(int));
-      dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(N,sizeof(double));
+      dYrowsloc[Yind]=(int *)calloc(N,sizeof(int));
+      dYcolsloc[Yind]=(int *)calloc(N,sizeof(int));
+      dYvalsloc[Yind]=(double *)calloc(N,sizeof(double));
+      
       for (j=0; j<N; j++){
-        dYcolsloc[dYnnzloc[Yind]][j]=j;
-        dYrowsloc[dYnnzloc[Yind]][j]=j;
-        dYvalsloc[dYnnzloc[Yind]][j]=1.0;
+        dYcolsloc[Yind][j]=j;
+        dYrowsloc[Yind][j]=j;
+        dYvalsloc[Yind][j]=1.0;
       }
       Yind++;
+      
       for (axis=0; axis<ndim; axis++){
         dYnnz[Yind]=2*N;
-        dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(2*N,sizeof(int));
-        dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(2*N,sizeof(int));
-        dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(2*N,sizeof(double));
+        dYrowsloc[Yind]=(int *)calloc(2*N,sizeof(int));
+        dYcolsloc[Yind]=(int *)calloc(2*N,sizeof(int));
+        dYvalsloc[Yind]=(double *)calloc(2*N,sizeof(double));
         for (j=0; j<N; j++){
           int stride =1;
           //unravel
-          for (int d=ndim-1; d>axis; d--){
-            stride *= Ns[d];
+          for (int d=ndim-1; d>=0; d--){
+            ns[d]=(j/stride)%Nsloc[d];
+            stride *= Nsloc[d];
           }
-          int na=(j/stride)%Ns[axis];
-          double scale=Ls[axis]/Ns[axis];
-          dYrowsloc[dYnnzloc[Yind]][2*j]=j;
-          dYcolsloc[dYnnzloc[Yind]][2*j]=stride+((Ns[axis]+na-1)%Ns[axis]);
-          dYvalsloc[dYnnzloc[Yind]][2*j]=1.0/scale;
-          dYrowsloc[dYnnzloc[Yind]][2*j+1]=j;
-          dYcolsloc[dYnnzloc[Yind]][2*j+1]=stride+((Ns[axis]+na-1)%Ns[axis]);
-          dYvalsloc[dYnnzloc[Yind]][2*j+1]=-1.0/scale;
+          //ravel
+          stride=1;
+          ns[axis]++;
+          ns[axis]%=Nsloc[axis];
+          int jp=0;
+          for (int d=ndim-1; d>=0; d--){
+            jp=jp+ns[d]*stride;
+            stride*=Nsloc[d];
+          }
+          stride=1;
+          ns[axis]+=Nsloc[axis];
+          ns[axis]-=2;
+          ns[axis]%=Nsloc[axis];
+          int jm=0;
+          for (int d=ndim-1; d>=0; d--){
+            jm=jm+ns[d]*stride;
+            stride*=Nsloc[d];
+          }
+          ns[axis]+=2;
+          ns[axis]%=Nsloc[axis];
+
+          double scale=Lsloc[axis]/Nsloc[axis];
+          dYrowsloc[Yind][2*j]=j;
+          dYcolsloc[Yind][2*j]=jp;
+          dYvalsloc[Yind][2*j]=0.5/scale;
+          dYrowsloc[Yind][2*j+1]=j;
+          dYcolsloc[Yind][2*j+1]=jm;
+          dYvalsloc[Yind][2*j+1]=-0.5/scale;
         }
         Yind++;
         for (axis2=0; axis2<ndim; axis2++){
+          fflush(stdout);
           if (axis==axis2)
             dYnnz[Yind]=3*N;
           else
             dYnnz[Yind]=4*N;
-          dYrowsloc[dYnnzloc[Yind]]=(int *)calloc(dYnnzloc[Yind],sizeof(int));
-          dYcolsloc[dYnnzloc[Yind]]=(int *)calloc(dYnnzloc[Yind],sizeof(int));
-          dYvalsloc[dYnnzloc[Yind]]=(double *)calloc(dYnnzloc[Yind],sizeof(double));
+          dYrowsloc[Yind]=(int *)calloc(dYnnz[Yind],sizeof(int));
+          dYcolsloc[Yind]=(int *)calloc(dYnnz[Yind],sizeof(int));
+          dYvalsloc[Yind]=(double *)calloc(dYnnz[Yind],sizeof(double));
           for (j=0; j<N; j++){
             //unravel first axis
             int stride =1;
-            for (int d=ndim-1; d>axis; d--){
-              stride *= Ns[d];
+            //unravel
+            for (int d=ndim-1; d>=0; d--){
+              ns[d]=(j/stride)%Nsloc[d];
+              stride *= Nsloc[d];
             }
-            int na=(j/stride)%Ns[axis];
-            int jp=stride+((N+na+1)%Ns[axis]);
-            int jm=stride+((N+na-1)%Ns[axis]);
-
-            //unravel second axis
-            int stride2 =1;
-            for (int d=ndim-1; d>axis2; d--){
-              stride2 *= Ns[d];
+            //ravel
+            stride=1;
+            ns[axis]++;
+            ns[axis]%=Nsloc[axis];
+            int jp=0;
+            for (int d=ndim-1; d>=0; d--){
+              jp=jp+ns[d]*stride;
+              stride*=Nsloc[d];
             }
-
-            int nap=(jp/stride2)%Ns[axis];
-            int nam=(jm/stride2)%Ns[axis];
-            double scale=1.0/(Ls[axis]/Ns[axis])/(Ls[axis2]/Ns[axis2]);
+            stride=1;
+            ns[axis]+=Nsloc[axis];
+            ns[axis]-=2;
+            ns[axis]%=Nsloc[axis];
+            int jm=0;
+            for (int d=ndim-1; d>=0; d--){
+              jm=jm+ns[d]*stride;
+              stride*=Nsloc[d];
+            }
+            ns[axis]++;
+            ns[axis]%=Nsloc[axis];
+            double scale=1.0/(Lsloc[axis]/Nsloc[axis])/(Lsloc[axis2]/Nsloc[axis2]);
 
             if(axis==axis2){
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=j;
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=-2.0/scale;
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=jp;
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=1.0/scale;
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=jm;
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=1.0/scale;
+              dYrowsloc[Yind][3*j]=j;
+              dYcolsloc[Yind][3*j]=j;
+              dYvalsloc[Yind][3*j]=-2.0/scale;
+              dYrowsloc[Yind][3*j+1]=j;
+              dYcolsloc[Yind][3*j+1]=jp;
+              dYvalsloc[Yind][3*j+1]=1.0/scale;
+              dYrowsloc[Yind][3*j+2]=j;
+              dYcolsloc[Yind][3*j+2]=jm;
+              dYvalsloc[Yind][3*j+2]=1.0/scale;
             }
             else{
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=stride2+((Ns[axis2]+nap+1)%Ns[axis2]);
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j]=1.0/scale;
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=stride2+((Ns[axis2]+nam+1)%Ns[axis2]);
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+1]=-1.0/scale;
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=stride2+((Ns[axis2]+nap-1)%Ns[axis2]);
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+2]=-1.0/scale;
-              dYrowsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=j;
-              dYcolsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=stride2+((Ns[axis2]+nam-1)%Ns[axis2]);
-              dYvalsloc[dYnnzloc[Yind]][dYnnzloc[Yind]*j+3]=1.0/scale;
+              //ravel
+              stride=1;
+              ns[axis]++;
+              ns[axis]%=Nsloc[axis];
+              ns[axis2]++;
+              ns[axis2]%=Nsloc[axis2];
+              int jpp=0;
+              for (int d=ndim-1; d>=0; d--){
+                jpp=jpp+ns[d]*stride;
+                stride*=Nsloc[d];
+              }
+              stride=1;
+              ns[axis2]+=Nsloc[axis2];
+              ns[axis2]-=2;
+              ns[axis2]%=Nsloc[axis2];
+              int jpm=0;
+              for (int d=ndim-1; d>=0; d--){
+                jpm=jpm+ns[d]*stride;
+                stride*=Nsloc[d];
+              }
+              stride=1;
+              ns[axis]+=Nsloc[axis];
+              ns[axis]-=2;
+              ns[axis]%=Nsloc[axis];
+              int jmm=0;
+              for (int d=ndim-1; d>=0; d--){
+                jmm=jmm+ns[d]*stride;
+                stride*=Nsloc[d];
+              }
+              stride=1;
+              ns[axis2]+=2;
+              ns[axis2]%=Nsloc[axis2];
+              int jmp=0;
+              for (int d=ndim-1; d>=0; d--){
+                jmp=jmp+ns[d]*stride;
+                stride*=Nsloc[d];
+              }
+
+              dYrowsloc[Yind][4*j]=j;
+              dYcolsloc[Yind][4*j]=jpp;
+              dYvalsloc[Yind][4*j]=0.5/scale;
+              dYrowsloc[Yind][4*j+1]=j;
+              dYcolsloc[Yind][4*j+1]=jpm;
+              dYvalsloc[Yind][4*j+1]=-0.5/scale;
+              dYrowsloc[Yind][4*j+2]=j;
+              dYcolsloc[Yind][4*j+2]=jmp;
+              dYvalsloc[Yind][4*j+2]=-0.5/scale;
+              dYrowsloc[Yind][4*j+3]=j;
+              dYcolsloc[Yind][4*j+3]=jmm;
+              dYvalsloc[Yind][4*j+3]=0.5/scale;
             }
-            Yind++;
           }
-        }
-        //copy everything to device
-        cudaMalloc ((void**)&dYnnz, (1+ndim+ndim*ndim)*sizeof(int));
-        cudaMalloc ((void**)&rowstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-        cudaMalloc ((void**)&rowstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-        cudaMalloc ((void**)&colstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-        cudaMalloc ((void**)&colstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-        cudaMalloc ((void**)&valstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(double));
-        cudaMalloc ((void**)&valstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(double));
-        cudaMalloc ((void**)&dYrows, (1+ndim+ndim*ndim)*sizeof(int *));
-        cudaMalloc ((void**)&dYcols, (1+ndim+ndim*ndim)*sizeof(int *));
-        cudaMalloc ((void**)&dYvals, (1+ndim+ndim*ndim)*sizeof(double *));
-        cudaMemcpy(dYnnz, dYnnzloc, (1+ndim+ndim*ndim)*sizeof(int), cudaMemcpyHostToDevice); 
-        for (int i=0; i<(1+ndim+ndim*ndim); i++){
-          cudaMalloc ((void**)&(dYrows[i]), dYnnzloc[i]*sizeof(int));
-          cudaMalloc ((void**)&(dYcols[i]), dYnnzloc[i]*sizeof(int));
-          cudaMalloc ((void**)&(dYvals[i]), dYnnzloc[i]*sizeof(double));
-          cudaMemcpy(dYrows[i], dYrowsloc[i], dYnnzloc[i]*sizeof(int), cudaMemcpyHostToDevice); 
-          cudaMemcpy(dYcols[i], dYcolsloc[i], dYnnzloc[i]*sizeof(int), cudaMemcpyHostToDevice); 
-          cudaMemcpy(dYvals[i], dYvalsloc[i], dYnnzloc[i]*sizeof(double), cudaMemcpyHostToDevice); 
+          Yind++;
         }
       }
+      //copy everything to device
+      cudaMalloc ((void**)&rowstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&rowstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&colstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&colstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&valstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(double));
+      cudaMalloc ((void**)&valstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(double));
+            
+      for (int i=0; i<(1+ndim+ndim*ndim); i++){
+        cudaMalloc((void **)&(dYrows[i]), dYnnz[i]*sizeof(int));
+        cudaMalloc((void **)&(dYcols[i]), dYnnz[i]*sizeof(int));
+        cudaMalloc((void **)&(dYvals[i]), dYnnz[i]*sizeof(double));
+        cudaMemcpy(dYrows[i], dYrowsloc[i], dYnnz[i]*sizeof(int), cudaMemcpyHostToDevice); 
+        cudaMemcpy(dYcols[i], dYcolsloc[i], dYnnz[i]*sizeof(int), cudaMemcpyHostToDevice); 
+        cudaMemcpy(dYvals[i], dYvalsloc[i], dYnnz[i]*sizeof(double), cudaMemcpyHostToDevice); 
+      }
     }
+    
     
     //host vector initialization
     if (fixed){
@@ -843,8 +933,8 @@ int main (int argc, char* argv[]) {
     cudaMemcpy(ones, onesloc, N*sizeof(double), cudaMemcpyHostToDevice);
 
     //parameters and dp45 initialization
-    parameters pars={
-      .handle=handle,
+    parameters pars={.handle=handle,
+      .sphandle=sphandle,
       .plans=plans,
       .N=N,
       .n=n,
@@ -856,6 +946,16 @@ int main (int argc, char* argv[]) {
       .f=f,
       .Y=Y,
       .yfft=yfft,
+      .dYnnz=dYnnz,
+      .dYrows=dYrows,
+      .dYcols=dYcols,
+      .dYvals=dYvals,
+      .rowstemp=rowstemp,
+      .colstemp=colstemp,
+      .valstemp=valstemp,
+      .rowstemp2=rowstemp2,
+      .colstemp2=colstemp2,
+      .valstemp2=valstemp2,
       .c=c,
       .nprods=nprods,
       .C=C,
@@ -865,6 +965,7 @@ int main (int argc, char* argv[]) {
       .steps=0,
       .verbose=verbose,
       .dense=dense,
+      .stiff=stiff,
       .t_eval=t_eval,
       .n_eval=n_eval,
       .eval_i=0,
@@ -878,6 +979,7 @@ int main (int argc, char* argv[]) {
       .outf=outf,
       .outY=outY,
     };
+
     y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
     cudaMemcpy(y, yloc, N*n*sizeof(double), cudaMemcpyHostToDevice);
 
@@ -894,11 +996,14 @@ int main (int argc, char* argv[]) {
     }
     if (dense>=2 && !reload){
       makeY(y, &pars);
+      printf("test\n");
       fwrite(Yloc,sizeof(cufftDoubleComplex),N*n*(1+ndim+ndim*ndim),outY);
       fflush(outY);
     }
     double *y_eval;
+    printf("test\n");
     y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
+    printf("test\n");
 
     //final state output 
     y_eval=dp45_eval(t,t_eval[n_eval-1]);
