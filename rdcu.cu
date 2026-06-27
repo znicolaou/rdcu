@@ -104,13 +104,33 @@ __global__ void make_jac_term (double* vals, int* rows, int* cols, double* term,
 void makeY (double *y, void *pars){
   parameters *p = (parameters *)pars;
   cublasDcopy(p->handle, p->N*p->n, y, 1, (double *)(p->Y), 2);
-
+  double one=1.0, zero=0.0;
   if(p->stiff){
-    //find finite differences
+    //find finite differences, can use sparse vector multiplication
+    for (int Yind=1; Yind<1+p->ndim+p->ndim*p->ndim; Yind++){
+      for(int i=0; i<p->n; i++){
+        //create sparse matrix pointing to dY[Yind], and do sparse matrix dense vector multiplication with &(y[N*i])
+        //store in p->Y[p->n*Yind+i] (cast to double* and use a output stride of 2)
+        cusparseSpMatDescr_t dY;
+        cusparseDnVecDescr_t x,y;
+        cusparseCreateCoo(&dY, p->N, p->N, p->dYnnz[Yind], p->dYrows[i], p->dYcols[i], p->dYvals[i],CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
+        cusparseCreateDnVec(&x, p->N, &(p->y[N*i]), CUDA_R_64F);
+        cusparseCreateDnVec(&x, p->N, (double *)(&(p->yfft)), CUDA_R_64F);
+        int buffersize=NULL;
+        cusparseSpMV_bufferSize(p->handle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one, dY, x, &zero, y, CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+        int *buffer=cudaMalloc(&buffer, bufferSize);
+        cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one,dY,x,&zero,y,CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, NULL);
+        cublasDcopy(p->handle, p->N*p->n, valstemp, 1, (double *)(&(p->Y[p->n*Yind+1])), 2);
+        cusparseDestroyDnVec(x);
+        cusparseDestroyDnVec(y);
+        cudaFree(buffer); //we could store these in p and reuse them
+      }
+    }
   }
 
   else{
     //pseudospectral
+    cublasDcopy(p->handle, p->N*p->n, y, 1, (double *)(p->Y), 2);
     cufftExecZ2Z(p->plans[0], p->Y, p->yfft, CUFFT_FORWARD);
     //in principle, we could track which derivatives are necessary and only calculate those
     for (int i=0; i<p->ndim; i++){
