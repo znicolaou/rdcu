@@ -105,27 +105,29 @@ void makeY (double *y, void *pars){
   parameters *p = (parameters *)pars;
   cublasDcopy(p->handle, p->N*p->n, y, 1, (double *)(p->Y), 2);
   double one=1.0, zero=0.0;
+  
   if(p->stiff){
     //find finite differences, can use sparse vector multiplication
+    cusparseSpMatDescr_t J;
+    cusparseDnVecDescr_t dy,dY;
+    size_t buffersize=0;
+    size_t *buffer;
 
     for (int Yind=1; Yind<1+p->ndim+p->ndim*p->ndim; Yind++){
       for(int i=0; i<p->n; i++){
-        printf("makeY\n");
-        fflush(stdout);
         //create sparse matrix pointing to dY[Yind], and do sparse matrix dense vector multiplication with &(y[N*i])
         //store in p->Y[p->n*Yind+i] (cast to double* and use a output stride of 2)
-        cusparseSpMatDescr_t J;
-        cusparseDnVecDescr_t dy,dY;
         cusparseCreateCoo(&J, p->N, p->N, p->dYnnz[Yind], p->dYrows[Yind], p->dYcols[Yind], p->dYvals[Yind],CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
         cusparseCreateDnVec(&dy, p->N, &(y[p->N*i]), CUDA_R_64F);
-        cusparseCreateDnVec(&dY, p->N, (double *)(&(p->yfft)), CUDA_R_64F);
-        size_t buffersize=0;
-        cusparseSpMV_bufferSize(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one, J, dy, &zero, dY, CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, &buffersize);
-        size_t *buffer=NULL;
+        cusparseCreateDnVec(&dY, p->N, (p->yfft), CUDA_R_64F);
+
+        cusparseSpMV_bufferSize(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, J, dy, &zero, dY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &buffersize);
         cudaMalloc(&buffer, buffersize);
-        cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE,&one,J,dy,&zero,dY,CUDA_R_64F,CUSPARSE_SPMV_ALG_DEFAULT, buffer);
-        cublasDcopy(p->handle, p->N, (double *)p->yfft, 1, (double *)(&(p->Y[p->n*Yind+i])), 2);
-        //maybe i should have a list of dnvecs that we can keep
+        cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, J, dy, &zero, dY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, buffer);
+        cublasDcopy(p->handle, p->N, (double *)(p->yfft), 1, (double *)(&(p->Y[p->N*p->n*Yind+p->N*i])), 2);
+
+        //maybe i should have a list of dnvecs that we don't recreate each time
+        //could also call preprocess
         cusparseDestroyDnVec(dy);
         cusparseDestroyDnVec(dY);
         cusparseDestroySpMat(J);
@@ -213,7 +215,7 @@ void jac (double t, double *y, int *nnz, int *Jrows, int *Jcols, double *Jvals, 
       
       //Add to term to J and store in Jtemp
       size_t bufferSize = 0;
-      void* buffer = NULL;
+      void* buffer;
       cusparseDcsrgeam2_bufferSizeExt(p->sphandle,p->n*p->N,p->n*p->N,&one,Jdesc,*nnz,Jvals,Jrows,Jcols,&one,termdesc,nnzterm,p->valstemp,p->rowstemp,p->colstemp,Jtempdesc,p->valstemp2,p->rowstemp2,p->colstemp2,&bufferSize);    
       cudaMalloc(&buffer, bufferSize);
       cusparseXcsrgeam2Nnz(p->sphandle,p->n*p->N,p->n*p->N,Jdesc,*nnz,Jrows,Jcols,termdesc,nnzterm,p->rowstemp,p->colstemp,Jtempdesc,p->rowstemp2,&nnztemp,&buffer);
@@ -643,9 +645,9 @@ int main (int argc, char* argv[]) {
         dYrowsloc[Yind][j]=j;
         dYvalsloc[Yind][j]=1.0;
       }
-      Yind++;
       
       for (axis=0; axis<ndim; axis++){
+        Yind=axis+1;
         dYnnz[Yind]=2*N;
         dYrowsloc[Yind]=(int *)calloc(2*N,sizeof(int));
         dYcolsloc[Yind]=(int *)calloc(2*N,sizeof(int));
@@ -686,9 +688,8 @@ int main (int argc, char* argv[]) {
           dYcolsloc[Yind][2*j+1]=jm;
           dYvalsloc[Yind][2*j+1]=-0.5/scale;
         }
-        Yind++;
         for (axis2=0; axis2<ndim; axis2++){
-          fflush(stdout);
+          Yind=axis2+ndim*axis+ndim+1;
           if (axis==axis2)
             dYnnz[Yind]=3*N;
           else
@@ -724,7 +725,7 @@ int main (int argc, char* argv[]) {
             }
             ns[axis]++;
             ns[axis]%=Nsloc[axis];
-            double scale=1.0/(Lsloc[axis]/Nsloc[axis])/(Lsloc[axis2]/Nsloc[axis2]);
+            double scale=(Lsloc[axis]/Nsloc[axis])*(Lsloc[axis2]/Nsloc[axis2]);
 
             if(axis==axis2){
               dYrowsloc[Yind][3*j]=j;
@@ -790,7 +791,6 @@ int main (int argc, char* argv[]) {
               dYvalsloc[Yind][4*j+3]=0.5/scale;
             }
           }
-          Yind++;
         }
       }
       //copy everything to device
@@ -974,29 +974,28 @@ int main (int argc, char* argv[]) {
     };
 
     y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
-    cudaMemcpy(y, yloc, N*n*sizeof(double), cudaMemcpyHostToDevice);
 
     //initial state output
     if (dense>=1 && !reload){
       fwrite(yloc,sizeof(double),N*n,outstates);
       fflush(outstates);
     }
+    
     if (dense>=2 && !reload){
       dydt(t,y,f,&pars);
       cudaMemcpy(yloc, f, N*n*sizeof(double), cudaMemcpyDeviceToHost);
       fwrite(yloc,sizeof(double),N*n,outf);
       fflush(outf);
+
+      if (dense>=3){
+        cudaMemcpy(Yloc, Y, 2*N*n*(1+ndim+ndim*ndim)*sizeof(double), cudaMemcpyDeviceToHost);
+        fwrite(Yloc,sizeof(cufftDoubleComplex),N*n*(1+ndim+ndim*ndim),outY);
+        fflush(outY);
+      }
     }
-    if (dense>=2 && !reload){
-      makeY(y, &pars);
-      printf("test\n");
-      fwrite(Yloc,sizeof(cufftDoubleComplex),N*n*(1+ndim+ndim*ndim),outY);
-      fflush(outY);
-    }
+
     double *y_eval;
-    printf("test\n");
     y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
-    printf("test\n");
 
     //final state output 
     y_eval=dp45_eval(t,t_eval[n_eval-1]);
