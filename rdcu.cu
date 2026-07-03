@@ -7,10 +7,14 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include "dp45_64.h"
+// #include "bdf.h"
 #include "cublas_v2.h"
 #include <cufft.h>
 #include <cusparse.h>
 #define PI 3.14159265358979323846
+
+int colsorder[4], order[4];
+double valsorder[4];
 
 typedef struct parameters
 {
@@ -31,6 +35,9 @@ typedef struct parameters
   int **dYrows;
   int **dYcols;
   double **dYvals;
+  int *rows;
+  int *cols;
+  double *vals;
   int *rowstemp;
   int *colstemp;
   double *valstemp;
@@ -59,6 +66,9 @@ typedef struct parameters
   FILE *outstates;
   FILE *outf;
   FILE *outY;
+  FILE *outrows;
+  FILE *outcols;
+  FILE *outvals;
 }parameters;
 
 __global__ void d1 (cufftDoubleComplex* Yin, cufftDoubleComplex* Yout, const int N, const int n, int *Ns, double *Ls, const int ndim, const int axis) {
@@ -91,9 +101,9 @@ __global__ void make_term (double* term, cufftDoubleComplex* Y, const int N, int
   }
 }
 
-__global__ void make_jac_term (double* vals, int* rows, int* cols, double* term, const int N, int coloffset, int rowoffset) {
+__global__ void make_jac_term (double* vals, int* rows, int* cols, double* term, const int nnz, int coloffset, int rowoffset) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
-  if (i<3*N){
+  if (i<nnz){
     vals[i]*=(term[rows[i]]);
     rows[i]+=rowoffset;
     cols[i]+=coloffset;
@@ -172,9 +182,13 @@ void dydt (double t, double *y, double *f, void *pars){
 }
 
 void jac (double t, double *y, int *nnz, int *Jrows, int *Jcols, double *Jvals, void *pars){
+
   parameters *p = (parameters *)pars;
   makeY(y, pars);  //necessary? will dydt always be called first?
   //zero out J and make temporary term sparse matrix
+  *nnz = 0;
+  cudaMemset(Jrows, 0, (p->N*p->n + 1) * sizeof(int));
+
   double one=1.0;
   int nnztemp=0;
   cusparseMatDescr_t Jdesc, termdesc, Jtempdesc;
@@ -182,62 +196,52 @@ void jac (double t, double *y, int *nnz, int *Jrows, int *Jcols, double *Jvals, 
   cusparseCreateMatDescr(&termdesc);
   cusparseCreateMatDescr(&Jtempdesc);
 
+
   //add terms
-  (*nnz)=0;
   for (int i=0; i<p->nterms; i++){
     //chain rule for each term 
-    for (int j=0; j<p->nprods[i]; j+=2){
+    for (int j=1; j<p->nprods[i]; j+=2){
       cudaMemcpy(p->term, p->ones, p->N*sizeof(double), cudaMemcpyDeviceToDevice);
       //product of powers
-      for (int k=0; k<p->nprods[i]; k+=2){
+      for (int k=1; k<p->nprods[i]; k+=2){
         int pow=p->c[i][k+1];
         if (k==j){
-          pow--;
           //multiply by the current derivative power and term coefficient
           double coeff=p->C[i]*pow;
-          cublasDaxpy(p->handle, p->N, &(coeff), p->term, 1, p->term,1);
+          cublasDscal(p->handle, p->N, &(coeff), p->term, 1);
+          pow--;
         }
         make_term<<<(p->N+255)/256, 256>>>(p->term, &(p->Y[p->N*p->c[i][k]]), p->N, pow);
       }
 
       //copy vals of dY/dj and multiply by the corresponding term 
-      int nnzterm=(p->dYnnz[p->c[i][j]/p->n]);
-      cudaMemcpy(p->valstemp, (p->dYvals[p->c[i][j]/p->n]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(p->rowstemp, (p->dYrows[p->c[i][j]/p->n]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(p->colstemp, (p->dYcols[p->c[i][j]/p->n]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
-      int coloffset=p->N*p->c[i][0];
-      int rowoffset=p->N*(p->c[i][j]%p->n);
-      make_jac_term<<<(nnzterm+255)/256, 256>>>(p->valstemp, p->rowstemp2, p->colstemp, p->term, p->N*p->n, coloffset, rowoffset);
+      int dYind=p->c[i][j]/p->n;
+      int nnzterm=(p->dYnnz[dYind]);
+      cudaMemcpy(p->valstemp, (p->dYvals[dYind]), nnzterm*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(p->rowstemp2, (p->dYrows[dYind]), nnzterm*sizeof(int), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(p->colstemp, (p->dYcols[dYind]), nnzterm*sizeof(int), cudaMemcpyDeviceToDevice);
+      int rowoffset=p->N*p->c[i][0];
+      int coloffset=p->N*(p->c[i][j]%p->n);
+      make_jac_term<<<(nnzterm+255)/256, 256>>>(p->valstemp, p->rowstemp2, p->colstemp, p->term, nnzterm, coloffset, rowoffset);
 
-      //create a sparse matrix for the term
       //convert to csr
-      cusparseXcoo2csr(p->sphandle, p->rowstemp, nnzterm, p->n*p->N, p->rowstemp2, CUSPARSE_INDEX_BASE_ZERO);
-      
+      cusparseXcoo2csr(p->sphandle, p->rowstemp2, nnzterm, p->n*p->N, p->rowstemp, CUSPARSE_INDEX_BASE_ZERO);
+
       //Add to term to J and store in Jtemp
       size_t bufferSize = 0;
       void* buffer;
-      cusparseDcsrgeam2_bufferSizeExt(p->sphandle,p->n*p->N,p->n*p->N,&one,Jdesc,*nnz,Jvals,Jrows,Jcols,&one,termdesc,nnzterm,p->valstemp,p->rowstemp,p->colstemp,Jtempdesc,p->valstemp2,p->rowstemp2,p->colstemp2,&bufferSize);    
+      cusparseDcsrgeam2_bufferSizeExt(p->sphandle,p->n*p->N,p->n*p->N,&one,termdesc,nnzterm,p->valstemp,p->rowstemp,p->colstemp,&one,Jdesc,*nnz,Jvals,Jrows,Jcols,Jtempdesc,p->valstemp2,p->rowstemp2,p->colstemp2,&bufferSize);    
       cudaMalloc(&buffer, bufferSize);
-      cusparseXcsrgeam2Nnz(p->sphandle,p->n*p->N,p->n*p->N,Jdesc,*nnz,Jrows,Jcols,termdesc,nnzterm,p->rowstemp,p->colstemp,Jtempdesc,p->rowstemp2,&nnztemp,&buffer);
-      cusparseDcsrgeam2(p->sphandle,p->n*p->N,p->n*p->N,&one,Jdesc,*nnz,Jvals,Jrows,Jcols,&one,termdesc,nnzterm,p->valstemp,p->rowstemp,p->colstemp,Jtempdesc,p->valstemp2,p->rowstemp2,p->colstemp2,&buffer);    
+      nnztemp=0;
+      cusparseXcsrgeam2Nnz(p->sphandle,p->n*p->N,p->n*p->N,termdesc,nnzterm,p->rowstemp,p->colstemp,Jdesc,*nnz,Jrows,Jcols,Jtempdesc,p->rowstemp2,&nnztemp,buffer);
+      cusparseDcsrgeam2(p->sphandle,p->n*p->N,p->n*p->N,&one,termdesc,nnzterm,p->valstemp,p->rowstemp,p->colstemp,&one,Jdesc,*nnz,Jvals,Jrows,Jcols,Jtempdesc,p->valstemp2,p->rowstemp2,p->colstemp2,buffer); 
       (*nnz)=nnztemp;
+
       cudaFree(buffer);
       //copy Jtemp to J
-      cudaMemcpy(Jrows, p->rowstemp2, p->n*p->N*sizeof(double), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(Jcols, p->colstemp2, nnztemp*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(Jrows, p->rowstemp2, (p->n*p->N+1)*sizeof(int), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(Jcols, p->colstemp2, nnztemp*sizeof(int), cudaMemcpyDeviceToDevice);
       cudaMemcpy(Jvals, p->valstemp2, nnztemp*sizeof(double), cudaMemcpyDeviceToDevice);
-      
-      // newer cuda 13 functions not available on machine yet
-      // cusparseCreateCsr(termdesc,p->n*p->N,p->n*p->N,3*p->N,p->crowstemp,p->colstemp,p->valstemp,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
-      // cusparseSpGEAMDescr_t spgeamDescr;
-      // cusparseSpGEAM_createDescr(spgeamDescr);
-      // cusparseCreateCsr(Jtempdesc,p->n*p->N,p->n*p->N,&nnz,p->crowstemp2,p->colstemp2,p->valstemp2,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
-      // cusparseSpGEAM_bufferSize(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,&bufferSize);
-      // cusparseSpGEAM_nnz(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
-      // cusparseSpMatGetSize(Jtempdesc, NULL, NULL, &nnz);
-      // cusparseSpGEAM(p->sphandle,CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,&one,Jdesc,&one,termdesc,Jtempdesc,CUDA_R_64F,CUSPARSE_SPGEAM_ALG1,spgeamDescr,buffer);
-      // cusparseSpGEAM_destroyDescr(spgeamDescr);
-      // cusparseCreateCsr(Jdesc,p->n*p->N,p->n*p->N,nnz,p->Jrows,p->Jcols,p->Jvals,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_64I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F);
     }
   }
   cusparseDestroyMatDescr(Jdesc);
@@ -281,6 +285,25 @@ void step_eval(double t, double h, double* y, void *pars){
       cudaMemcpy(p->Yloc, p->Y, p->N*p->n*(1+p->ndim+p->ndim*p->ndim)*sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
       fwrite(p->Yloc,sizeof(cufftDoubleComplex),p->N*p->n*(1+p->ndim+p->ndim*p->ndim),p->outY);
       // fflush(p->outY);
+    }
+    if(p->dense>=4){
+      int nnz=0;
+      jac(p->t_eval[p->eval_i], y_eval, &nnz, p->rows, p->cols, p->vals, pars);
+      //keep these local variables in pars?
+      double *valsloc;
+      int *rowsloc,*colsloc;
+      valsloc=(double*)malloc(nnz*sizeof(double));
+      rowsloc=(int*)malloc((p->N*p->n+1)*sizeof(int));
+      colsloc=(int*)malloc(nnz*sizeof(int));
+      cudaMemcpy(rowsloc, p->rows, (p->N*p->n+1)*sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemcpy(colsloc, p->cols, nnz*sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemcpy(valsloc, p->vals, nnz*sizeof(double), cudaMemcpyDeviceToHost);
+      fwrite(rowsloc,sizeof(int),p->N*p->n+1,p->outrows);
+      fwrite(colsloc,sizeof(int),nnz,p->outcols);
+      fwrite(valsloc,sizeof(double),nnz,p->outvals);
+      fflush(p->outrows);
+      fflush(p->outcols);
+      fflush(p->outvals);
     }
     p->eval_i++;
     eval=1;
@@ -332,6 +355,15 @@ int fparse_list(const char *optarg, const char* delim, double *lst, int *len, in
     }
   }
   return chars;
+}
+
+int compare_indices(const void *a, const void *b) {
+  int idx1 = *(const int *)a;
+  int idx2 = *(const int *)b;
+  
+  if (colsorder[idx1] < colsorder[idx2]) return -1;
+  if (colsorder[idx1] > colsorder[idx2]) return 1;
+  return 0;
 }
 
 int main (int argc, char* argv[]) {
@@ -578,10 +610,10 @@ int main (int argc, char* argv[]) {
 
     double t=0,h=1;
     int i=0,j=0,k=0,axis=0,axis2=0;
-    int *Ns;
+    int *Ns, nnz;
     double *yloc, *y, *f, *onesloc, *ones, *term, *Ls;
-    int *rowstemp, *rowstemp2, *colstemp, *colstemp2, **dYrowsloc, **dYcolsloc, **dYrows, **dYcols, *dYnnz;
-    double *valstemp, *valstemp2, **dYvalsloc, **dYvals;
+    int *rows,*rowstemp, *rowstemp2, *cols,*colstemp, *colstemp2, **dYrowsloc, **dYcolsloc, **dYrows, **dYcols, *dYnnz;
+    double *vals,*valstemp, *valstemp2, **dYvalsloc, **dYvals;
     cufftDoubleComplex *Yloc, *Y, *yfftloc, *yfft;
     int N=Nsloc[0];
     for (i=1; i<ndim; i++){
@@ -681,13 +713,22 @@ int main (int argc, char* argv[]) {
           ns[axis]%=Nsloc[axis];
 
           double scale=Lsloc[axis]/Nsloc[axis];
-          dYrowsloc[Yind][2*j]=j;
-          dYcolsloc[Yind][2*j]=jp;
-          dYvalsloc[Yind][2*j]=0.5/scale;
-          dYrowsloc[Yind][2*j+1]=j;
-          dYcolsloc[Yind][2*j+1]=jm;
-          dYvalsloc[Yind][2*j+1]=-0.5/scale;
+
+          order[0]=0;
+          order[1]=1;
+          valsorder[0]=-0.5/scale;
+          valsorder[1]=0.5/scale;
+          colsorder[0]=jm;
+          colsorder[1]=jp;
+          qsort(order, 2, sizeof(int), compare_indices);
+          
+          for (int k=0; k<2; k++){
+            dYrowsloc[Yind][2*j+k]=j;
+            dYcolsloc[Yind][2*j+k]=colsorder[order[k]];
+            dYvalsloc[Yind][2*j+k]=valsorder[order[k]];
+          }
         }
+        
         for (axis2=0; axis2<ndim; axis2++){
           Yind=axis2+ndim*axis+ndim+1;
           if (axis==axis2)
@@ -697,6 +738,7 @@ int main (int argc, char* argv[]) {
           dYrowsloc[Yind]=(int *)calloc(dYnnz[Yind],sizeof(int));
           dYcolsloc[Yind]=(int *)calloc(dYnnz[Yind],sizeof(int));
           dYvalsloc[Yind]=(double *)calloc(dYnnz[Yind],sizeof(double));
+
           for (j=0; j<N; j++){
             //unravel first axis
             int stride =1;
@@ -726,18 +768,27 @@ int main (int argc, char* argv[]) {
             ns[axis]++;
             ns[axis]%=Nsloc[axis];
             double scale=(Lsloc[axis]/Nsloc[axis])*(Lsloc[axis2]/Nsloc[axis2]);
-
+            
             if(axis==axis2){
-              dYrowsloc[Yind][3*j]=j;
-              dYcolsloc[Yind][3*j]=j;
-              dYvalsloc[Yind][3*j]=-2.0/scale;
-              dYrowsloc[Yind][3*j+1]=j;
-              dYcolsloc[Yind][3*j+1]=jp;
-              dYvalsloc[Yind][3*j+1]=1.0/scale;
-              dYrowsloc[Yind][3*j+2]=j;
-              dYcolsloc[Yind][3*j+2]=jm;
-              dYvalsloc[Yind][3*j+2]=1.0/scale;
+              order[0]=0;
+              order[1]=1;
+              order[2]=2;
+              valsorder[0]=1.0/scale;
+              valsorder[1]=-2.0/scale;
+              valsorder[2]=1.0/scale;
+              colsorder[0]=jm;
+              colsorder[1]=j;
+              colsorder[2]=jp;
+              qsort(order, 3, sizeof(int), compare_indices);
+
+              for (int k=0; k<3; k++){
+                dYrowsloc[Yind][3*j+k]=j;
+                dYcolsloc[Yind][3*j+k]=colsorder[order[k]];
+                dYvalsloc[Yind][3*j+k]=valsorder[order[k]];
+              }
+
             }
+
             else{
               //ravel
               stride=1;
@@ -777,29 +828,40 @@ int main (int argc, char* argv[]) {
                 stride*=Nsloc[d];
               }
 
-              dYrowsloc[Yind][4*j]=j;
-              dYcolsloc[Yind][4*j]=jpp;
-              dYvalsloc[Yind][4*j]=0.5/scale;
-              dYrowsloc[Yind][4*j+1]=j;
-              dYcolsloc[Yind][4*j+1]=jpm;
-              dYvalsloc[Yind][4*j+1]=-0.5/scale;
-              dYrowsloc[Yind][4*j+2]=j;
-              dYcolsloc[Yind][4*j+2]=jmp;
-              dYvalsloc[Yind][4*j+2]=-0.5/scale;
-              dYrowsloc[Yind][4*j+3]=j;
-              dYcolsloc[Yind][4*j+3]=jmm;
-              dYvalsloc[Yind][4*j+3]=0.5/scale;
+              order[0]=0;
+              order[1]=1;
+              order[2]=2;
+              order[3]=3;
+              valsorder[0]=0.5/scale;
+              valsorder[1]=-0.5/scale;
+              valsorder[2]=-0.5/scale;
+              valsorder[3]=0.5/scale;
+              colsorder[0]=jmm;
+              colsorder[1]=jmp;
+              colsorder[2]=jpm;
+              colsorder[3]=jpp;
+              qsort(order, 4, sizeof(int), compare_indices);
+
+              for (int k=0; k<4; k++){
+                dYrowsloc[Yind][4*j+k]=j;
+                dYcolsloc[Yind][4*j+k]=colsorder[order[k]];
+                dYvalsloc[Yind][4*j+k]=valsorder[order[k]];
+              }
             }
           }
         }
       }
       //copy everything to device
-      cudaMalloc ((void**)&rowstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-      cudaMalloc ((void**)&rowstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-      cudaMalloc ((void**)&colstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-      cudaMalloc ((void**)&colstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(int));
-      cudaMalloc ((void**)&valstemp, 5*N*n*(1+ndim+ndim*ndim)*sizeof(double));
-      cudaMalloc ((void**)&valstemp2, 5*N*n*(1+ndim+ndim*ndim)*sizeof(double));
+      //fix arbitrary 100 here considering nterms and n
+      cudaMalloc ((void**)&rows, 100*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&cols, 100*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&vals, 100*N*n*(1+ndim+ndim*ndim)*sizeof(double));
+      cudaMalloc ((void**)&rowstemp, 100*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&rowstemp2, 100*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&colstemp, 100*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&colstemp2, 100*N*n*(1+ndim+ndim*ndim)*sizeof(int));
+      cudaMalloc ((void**)&valstemp, 100*N*n*(1+ndim+ndim*ndim)*sizeof(double));
+      cudaMalloc ((void**)&valstemp2, 100*N*n*(1+ndim+ndim*ndim)*sizeof(double));
             
       for (int i=0; i<(1+ndim+ndim*ndim); i++){
         cudaMalloc((void **)&(dYrows[i]), dYnnz[i]*sizeof(int));
@@ -881,7 +943,7 @@ int main (int argc, char* argv[]) {
       fclose(in);
     }
 
-    FILE *outtimes,*outstates,*outf,*outY;
+    FILE *outtimes,*outstates,*outf,*outY,*outrows,*outcols,*outvals;
     char writetype[3]="wb";
     if(reloaded){
       writetype[0]='a';
@@ -904,6 +966,17 @@ int main (int argc, char* argv[]) {
       strcpy(file,filebase);
       strcat(file,"Y.dat");
       outY=fopen(file,writetype);
+    }
+    if(dense>=4){
+      strcpy(file,filebase);
+      strcat(file,"rows.dat");
+      outrows=fopen(file,writetype);
+      strcpy(file,filebase);
+      strcat(file,"cols.dat");
+      outcols=fopen(file,writetype);
+      strcpy(file,filebase);
+      strcat(file,"vals.dat");
+      outvals=fopen(file,writetype);
     }
 
     int n0=int(t/dt)+1;
@@ -943,6 +1016,9 @@ int main (int argc, char* argv[]) {
       .dYrows=dYrows,
       .dYcols=dYcols,
       .dYvals=dYvals,
+      .rows=rows,
+      .cols=cols,
+      .vals=vals,
       .rowstemp=rowstemp,
       .colstemp=colstemp,
       .valstemp=valstemp,
@@ -971,6 +1047,9 @@ int main (int argc, char* argv[]) {
       .outstates=outstates,
       .outf=outf,
       .outY=outY,
+      .outrows=outrows,
+      .outcols=outcols,
+      .outvals=outvals,
     };
 
     y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
@@ -991,6 +1070,24 @@ int main (int argc, char* argv[]) {
         cudaMemcpy(Yloc, Y, 2*N*n*(1+ndim+ndim*ndim)*sizeof(double), cudaMemcpyDeviceToHost);
         fwrite(Yloc,sizeof(cufftDoubleComplex),N*n*(1+ndim+ndim*ndim),outY);
         fflush(outY);
+      }
+
+      if (dense>=4){
+        jac(t,y,&nnz,rows,cols,vals,&pars);
+        double *valsloc;
+        int *rowsloc,*colsloc;
+        valsloc=(double*)malloc(nnz*sizeof(double));
+        rowsloc=(int*)malloc((N*n+1)*sizeof(int));
+        colsloc=(int*)malloc(nnz*sizeof(int));
+        cudaMemcpy(rowsloc, rows, (N*n+1)*sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(colsloc, cols, nnz*sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(valsloc, vals, nnz*sizeof(double), cudaMemcpyDeviceToHost);
+        fwrite(rowsloc,sizeof(int),N*n+1,outrows);
+        fwrite(colsloc,sizeof(int),nnz,outcols);
+        fwrite(valsloc,sizeof(double),nnz,outvals);
+        fflush(outrows);
+        fflush(outcols);
+        fflush(outvals);
       }
     }
 
@@ -1028,6 +1125,11 @@ int main (int argc, char* argv[]) {
     }
     if(dense>=3){
       fclose(outY);
+    }
+    if(dense>=4){
+      fclose(outrows);
+      fclose(outcols);
+      fclose(outvals);
     }
 
     free(yloc);
