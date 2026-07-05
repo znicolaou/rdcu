@@ -22,7 +22,7 @@ static unsigned long int N;
 static void (*dydt)(double, double*, double*, void*) = NULL;
 static void (*jac)(double, double*, int*, int*, int*, double*, void*) = NULL;
 static double atl, rtl;
-static int fixed, nwit=4, refactor=1, rejac=1, order=1, nnz=0, nnzA=0;
+static int fixed, nwit=4, refactor=1, rejac=1, order=1, nnz=0, nnzA=0, nstep=0;
 static cublasHandle_t handle;
 
 static cudssHandle_t dsshandle;
@@ -182,7 +182,6 @@ int bdf_step (double *t, double *h, void* pars){
     scale_err<<<(N+255)/256, 256>>>(dd, yscale, yerr, N);
     cublasDnrm2(handle, N, yerr, 1, &dnorm);
     dnorm /= pow(N,0.5);
-
     if (dnormold>0){
       rate=dnorm/dnormold;
     }
@@ -207,23 +206,34 @@ int bdf_step (double *t, double *h, void* pars){
 
   //no newton convergence
   if(!converged){
+    scale_err<<<(N+255)/256, 256>>>(d, yscale, yerr, N);
+    cublasDnrm2(handle, N, yerr, 1, &dnorm);
+    dnorm /= pow(N,0.5);
+
     //recalculate the jacobian if needed
     if(rejac){
       (*jac)((*t)+(*h),y,&nnz,rows,cols,vals,pars);
       refactor=1;
       rejac=0;
+      nstep--;
+      nconststeps=0;
+      return 0;
     }
 
     //reject and half the stepsize  
     else{
       factor=0.5;
       (*h)*=factor;
+
       makeRU(RU, order, factor);
-      cudaMemcpy(RU, RUloc, (order+2)*(order+2)*sizeof(double), cudaMemcpyHostToDevice);
+      cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
       updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
-      cudaMemcpy(D, Dnew, 6*N*sizeof(double), cudaMemcpyDeviceToDevice);
-      
+      cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
+
+      nstep--;
       refactor=1;
+      rejac=1;
+      nconststeps=0;
       return 0;
     }
   }
@@ -248,15 +258,18 @@ int bdf_step (double *t, double *h, void* pars){
   errnorm /= pow(N,0.5);
   factor=safety * pow(errnorm, (-1.0 / (order + 1)));
 
-  //reject and increase h
+  //reject and decrease h
   if (errnorm>1){
+      if(factor < 0.2){
+        factor=0.2;
+      }
       (*h)=(*h)*factor;
       makeRU(RU, order, factor);
-      cudaMemcpy(RU, RUloc, (order+2)*(order+2)*sizeof(double), cudaMemcpyHostToDevice);
+      cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
       updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
-      cudaMemcpy(D, Dnew, 6*N*sizeof(double), cudaMemcpyDeviceToDevice);
-      rejac=1;
+      cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
       nconststeps=0;
+      nstep--;
       return 0;
   }
   
@@ -276,7 +289,7 @@ int bdf_step (double *t, double *h, void* pars){
   nconststeps++;
   if(nconststeps>order) {
     //update order and h
-    double errnormminus=INFINITY, errnormplus=INFINITY, factorminus=INFINITY, factorplus=INFINITY;
+    double errnormminus=INFINITY, errnormplus=INFINITY, factorminus=0.0, factorplus=0.0;
     //predicted rate for order-1
     if (order>1){
       errconst=kappaloc[order-1]*gammabdfloc[order-1]+1.0/(order);
@@ -303,21 +316,22 @@ int bdf_step (double *t, double *h, void* pars){
     if (order>1 && factorminus > factor && factorminus > factorplus){
       factor=factorminus;
       dorder=-1;
-      nconststeps=0;
     }
-    else if (factorplus > factor && order<5){
+    else if (order<5 && factorplus > factor){
       factor=factorplus;
       dorder=1;
-      
     }
-    
+
+    if (factor > 10){
+      factor=10;
+    }
+
     (*h)=(*h)*factor;
     order+=dorder;
     makeRU(RU, order, factor);
     cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
     updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
-    cudaMemcpy(D, Dnew, 6*N*sizeof(double), cudaMemcpyDeviceToDevice);
-
+    cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
     nconststeps=0;
     refactor=1;
   }
@@ -341,7 +355,7 @@ double* bdf_run(double *t, double *h, double t1, void *pars, void (*step_eval)(d
   cudssMatrixCreateDn(&dddss, N, 1, N, dd, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR);
   cudssMatrixCreateDn(&bdss, N, 1, N, b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR);
 
-  cublasDscal(handle, 6*N, &zero, D, 1);
+  cublasDscal(handle, 8*N, &zero, D, 1);
   cudaMemcpy (&(D[0]), y, N*sizeof(double), cudaMemcpyDeviceToDevice);
   cudaMemcpy (&(D[N]), f, N*sizeof(double), cudaMemcpyDeviceToDevice);
   cublasDscal(handle, N, h, &(D[N]), 1);
@@ -375,8 +389,8 @@ double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, dou
   if (pow(rtol,0.5)<0.03) {
     ntol=pow(rtol,0.5);
   }
-  if (pow(2,-52)/rtol > ntol) {
-    ntol=pow(2,-52)/(rtol+pow(2,-52));
+  if (10*pow(2,-52)/rtol > ntol) {
+    ntol=10*pow(2,-52)/(rtol+pow(2,-52));
   }
 
   fixed=fixedstep;
