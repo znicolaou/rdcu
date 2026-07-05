@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include "cublas_v2.h"
 #include "cudss.h"
+#include "cusparse.h"
 
 int bdf_step (double *t, double *h, void* pars);
 double* bdf_init(int n, int nnzmax,double atl, double rtl, int fixedstep, double *yloc, cublasHandle_t h, void (*dydt)(double, double*, double*, void*), void (*jac_func)(double, double*, int*, int*, int*, double*, void*));

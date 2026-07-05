@@ -187,7 +187,7 @@ void dydt (double t, double *y, double *f, void *pars){
 void jac (double t, double *y, int *nnz, int *Jrows, int *Jcols, double *Jvals, void *pars){
   parameters *p = (parameters *)pars;
   
-  // makeY(y, pars);  //necessary? will dydt always be called first?
+  makeY(y, pars);  //necessary? will dydt always be called first?
   //zero out J and make temporary term sparse matrix
   *nnz = 0;
   cudaMemset(Jrows, 0, (p->N*p->n + 1) * sizeof(int));
@@ -270,7 +270,12 @@ void step_eval(double t, double h, double* y, void *pars){
   int eval=0;
   while (t >= p->t_eval[p->eval_i] && p->eval_i<p->n_eval){
     double *y_eval;
-    y_eval=dp45_eval(t,p->t_eval[p->eval_i]);
+    if(!p->stiff){
+      y_eval=dp45_eval(t,p->t_eval[p->eval_i]);
+    }
+    else{
+      y_eval=bdf_eval(t,h,p->t_eval[p->eval_i]);
+    }
     if(p->dense>=1){
       cudaMemcpy(p->yloc, y_eval, p->N*p->n*sizeof(double), cudaMemcpyDeviceToHost);
       fwrite(p->yloc,sizeof(double),p->N*p->n,p->outstates);
@@ -572,7 +577,7 @@ int main (int argc, char* argv[]) {
     struct timeval start,end;
     gettimeofday(&start,NULL);
 
-    double t1=1e2, dt=1e0, atl=1e-6, rtl=0, A=1.0;
+    double t1=1e2, dt=1e0, atl=1e-6, rtl=1e-6, A=1.0;
     int gpu=0, seed=1, fixed=0, n=1, ndim=1, nterms=0, ndim2=0, verbose=0, help=1, dense=1, stiff=0, reload=0;
     int Nsloc[3]={128,128,128}, *c[1024]={0}, nprods[1024]={0};
     double Lsloc[3]={1.0,1.0,1.0}, C[1024]={0};
