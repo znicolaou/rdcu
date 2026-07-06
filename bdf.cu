@@ -12,7 +12,7 @@ const double alphaloc[6] = {0.0000000000000000,1.1850000000000001,1.666666666666
 const double betaloc[6] = {1.0000000000000000,0.3150000000000000,0.1666666666666667,0.0991166666666667,0.1135416666666667,0.1666666666666667};
 
 static double *kappa, *gammabdf, *alpha, *beta;
-static double one=1.0, errconst, nconststeps=0;
+static double one=1.0, nconststeps=0;
 static double *y, *yscale, *f, *d, *dd, *b, *D, *Dnew, *ytemp, *yerr, *y_eval, *vals, *Ivals, *Avals, ntol;
 static double R[36], U[36], RUloc[36];
 static double *RU;
@@ -22,7 +22,7 @@ static unsigned long int N;
 static void (*dydt)(double, double*, double*, void*) = NULL;
 static void (*jac)(double, double*, int*, int*, int*, double*, void*) = NULL;
 static double atl, rtl;
-static int fixed, nwit=4, refactor=1, rejac=1, order=1, nnz=0, nnzA=0, nstep=0;
+static int fixed, nwit=4, refactor=1, rejac=1, order=1, nnz=0, nnzA=0;
 static cublasHandle_t handle;
 
 static cudssHandle_t dsshandle;
@@ -126,14 +126,6 @@ __global__ void interpolate (double *y, double *D, const unsigned long int N, in
   }
 }
 
-//Error estimate for the BDF stepper
-__global__ void error (double *err, double *D, const unsigned long int N, int order, double *beta) {
-  int i = blockIdx.x*blockDim.x + threadIdx.x;
-  if(i<N){
-    err[i]=D[N*(order+1)+i]*beta[order+1];
-  }
-}
-
 __global__ void scale_err (double *d, double *yscale, double *yerr, const unsigned long int N) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if(i<N){
@@ -206,17 +198,13 @@ int bdf_step (double *t, double *h, void* pars){
 
   //no newton convergence
   if(!converged){
-    scale_err<<<(N+255)/256, 256>>>(d, yscale, yerr, N);
-    cublasDnrm2(handle, N, yerr, 1, &dnorm);
-    dnorm /= pow(N,0.5);
 
     //recalculate the jacobian if needed
     if(rejac){
-      (*jac)((*t)+(*h),y,&nnz,rows,cols,vals,pars);
+      step0<<<(N+255)/256, 256>>>(ytemp, D, N, order);
+      (*jac)((*t)+(*h),ytemp,&nnz,rows,cols,vals,pars);
       refactor=1;
       rejac=0;
-      nstep--;
-      nconststeps=0;
       return 0;
     }
 
@@ -230,7 +218,6 @@ int bdf_step (double *t, double *h, void* pars){
       updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
       cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
 
-      nstep--;
       refactor=1;
       rejac=1;
       nconststeps=0;
@@ -250,12 +237,10 @@ int bdf_step (double *t, double *h, void* pars){
 
   cudaMemcpy(yscale, ytemp, N*sizeof(double), cudaMemcpyDeviceToDevice);
   errscale<<<(N+255)/256, 256>>>(yscale, atl, rtl, N);
-  errconst=kappaloc[order]*gammabdfloc[order]+1.0/(order+1);
-  cublasDscal(handle, N, &zero, yerr, 1);
-  cublasDaxpy(handle, N, &errconst, d, 1, yerr, 1);
+  cudaMemcpy(yerr, d, N*sizeof(double), cudaMemcpyDeviceToDevice);
   scale_err<<<(N+255)/256, 256>>>(yerr, yscale, yerr, N);
   cublasDnrm2(handle, N, yerr, 1, &errnorm);
-  errnorm /= pow(N,0.5);
+  errnorm *= betaloc[order]/pow(N,0.5);
   factor=safety * pow(errnorm, (-1.0 / (order + 1)));
 
   //reject and decrease h
@@ -264,23 +249,24 @@ int bdf_step (double *t, double *h, void* pars){
         factor=0.2;
       }
       (*h)=(*h)*factor;
+
       makeRU(RU, order, factor);
       cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
       updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
       cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
+      //refactor=1;
+
       nconststeps=0;
-      nstep--;
       return 0;
   }
   
   //accept; update t, y, and D
   (*t)=(*t)+(*h);
-  rejac=1;
   cudaMemcpy(y, ytemp,  N*sizeof(double), cudaMemcpyDeviceToDevice);
+  rejac=1;
 
   cudaMemcpy(&(D[N*(order+2)]), d,  N*sizeof(double), cudaMemcpyDeviceToDevice);
   cublasDaxpy(handle, N, &(mone), &(D[N*(order+1)]), 1, &(D[N*(order+2)]), 1);
-
   cudaMemcpy(&(D[N*(order+1)]), d,  N*sizeof(double), cudaMemcpyDeviceToDevice);
   for (int i=order; i>=0; i--){
     cublasDaxpy(handle, N, &one, &(D[N*(i+1)]), 1, &(D[N*(i)]), 1);
@@ -292,23 +278,19 @@ int bdf_step (double *t, double *h, void* pars){
     double errnormminus=INFINITY, errnormplus=INFINITY, factorminus=0.0, factorplus=0.0;
     //predicted rate for order-1
     if (order>1){
-      errconst=kappaloc[order-1]*gammabdfloc[order-1]+1.0/(order);
-      cublasDscal(handle, N, &zero, yerr, 1);
-      cublasDaxpy(handle, N, &errconst, &(D[N*order]), 1, yerr, 1);
+      cudaMemcpy(yerr, &(D[N*order]), N*sizeof(double), cudaMemcpyDeviceToDevice);
       scale_err<<<(N+255)/256, 256>>>(yerr, yscale, yerr, N);
       cublasDnrm2(handle, N, yerr, 1, &errnormminus);
-      errnormminus /= pow(N,0.5);
+      errnormminus *= betaloc[order-1]/pow(N,0.5);
       factorminus=safety * pow(errnormminus, (-1.0 / (order)));
 
     }
     //predicted rate for order+1
     if (order<5){
-      errconst=kappaloc[order+1]*gammabdfloc[order+1]+1.0/(order+2);
-      cublasDscal(handle, N, &zero, yerr, 1);
-      cublasDaxpy(handle, N, &errconst, &(D[N*(order+2)]), 1, yerr, 1);
+      cudaMemcpy(yerr, &(D[N*(order+2)]), N*sizeof(double), cudaMemcpyDeviceToDevice);
       scale_err<<<(N+255)/256, 256>>>(yerr, yscale, yerr, N);
       cublasDnrm2(handle, N, yerr, 1, &errnormplus);
-      errnormplus /= pow(N,0.5);
+      errnormplus *= betaloc[order+1]/pow(N,0.5);
       factorplus=safety * pow(errnormplus, (-1.0 / (order + 2)));
     }  
 
@@ -321,17 +303,18 @@ int bdf_step (double *t, double *h, void* pars){
       factor=factorplus;
       dorder=1;
     }
-
     if (factor > 10){
       factor=10;
     }
 
     (*h)=(*h)*factor;
     order+=dorder;
+
     makeRU(RU, order, factor);
     cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
     updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
     cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
+    
     nconststeps=0;
     refactor=1;
   }
