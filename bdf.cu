@@ -2,7 +2,6 @@
 //BDF stepper on the gpu
 //requires sparse jacobian input (as in finite-difference discretizations)
 //implicit linear system solved with sparse lu cudss
-//iterative solver w/ preconditioning not yet implemented
 #include "bdf.h"
 
 //bdf coefficients
@@ -10,18 +9,18 @@ const double kappaloc[6] = {0.0,-0.1850,-1.0/9,-0.0823,-0.0415,0.0};
 const double gammabdfloc[6] = {0.0,1.0,1.0+1.0/2,1.0+1.0/2+1.0/3,1.0+1.0/2+1.0/3+1.0/4,1.0+1.0/2+1.0/3+1.0/4+1.0/5};
 
 static double *gammabdf;
-static double one=1.0, nconststeps=0;
-static double *y, *yscale, *f, *d, *dd, *b, *D, *Dnew, *ytemp, *yerr, *y_eval, *vals, *Ivals, *Avals, ntol;
-static double R[36], U[36], RUloc[36];
+static double zero=0.0, one=1.0, mone=-1.0, nconststeps=0;
+static double *yscale, *f, *d, *dd, *b, *D, *Dnew, *ytemp, *yerr, *y_eval, *vals, *Ivals, *Avals, ntol;
+static double R[36], U[36], *RUloc;
 static double *RU;
-static int *rows, *cols, *Irows, *Icols, *Arows, *Acols, nstep=0;
+static int *rows, *cols, *Irows, *Icols, *Arows, *Acols;
 static void *buffer;
 
 static unsigned long int N;
 static void (*dydt)(double, double*, double*, void*) = NULL;
 static void (*jac)(double, double*, int*, int*, int*, double*, void*) = NULL;
 static double atl, rtl;
-static int fixed, nwit=4, refactor=1, rejac=1, order=1, nnz=0, nnzA=0;
+static int fixed, nwit=4, refactor=1, rejac=1, nnz=0, nnzA=0;
 static cublasHandle_t handle;
 
 static cudssHandle_t dsshandle;
@@ -66,6 +65,7 @@ void makeRU(double *RU, int order, double factor){
       }
     }
   }
+  cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
 }
 
 // update backward differences when stepsize changes
@@ -131,24 +131,15 @@ __global__ void scale_err (double *d, double *yscale, double *yerr, const unsign
   }
 }
 
-void makeA(double factor){
-  cusparseDcsrgeam2(sphandle,N,N,&one,Idesc,N,Ivals,Irows,Icols,&factor,Jdesc,nnz,vals,rows,cols,Adesc,Avals,Arows,Acols,buffer); 
-}
-
-
 //Attempt a BDF step
-int bdf_step (double *t, double *h, void* pars){
+int bdf_step (double *t, double *h, double hmin, double hmax, int *order, void* pars){
   int converged=0, it=0;
-  double dnorm=0, dnormold=0,rate=0,zero=0.0,one=1.0,mone=-1.0,factor=1.0;
+  double dnorm=0, dnormold=0,rate=0,factor=1.0;
   //Calculate the predictor and store in ytemp
-  step0<<<(N+255)/256, 256>>>(ytemp, D, N, order);
+  step0<<<(N+255)/256, 256>>>(ytemp, D, N, *order);
   //find the scale for the newton iteration stopping 
   cudaMemcpy(yscale, ytemp, N*sizeof(double), cudaMemcpyDeviceToDevice);
   errscale<<<(N+255)/256, 256>>>(yscale, atl, rtl, N);
-  // cublasDnrm2(handle, N, yscale, 1, &dnorm);
-  // dnorm /= pow(N,0.5);
-  // printf("yscale %e\n", dnorm);
-
   cublasDscal(handle, N, &zero, d, 1);
   
   //Newton solver for implicit equation
@@ -157,12 +148,13 @@ int bdf_step (double *t, double *h, void* pars){
     (*dydt)((*t)+(*h),ytemp,f,pars);
     //refactor to find LU if needed
     if(refactor){
-      makeA(-(*h)/((1-kappaloc[order])*gammabdfloc[order]));
+      double alpha=-(*h)/((1-kappaloc[*order])*gammabdfloc[*order]);
+      cusparseDcsrgeam2(sphandle,N,N,&one,Idesc,N,Ivals,Irows,Icols,&alpha,Jdesc,nnz,vals,rows,cols,Adesc,Avals,Arows,Acols,buffer); 
       cudssExecute(dsshandle, CUDSS_PHASE_REFACTORIZATION, config, data, A, dddss, bdss);
       refactor=0;
     }
     //calculate rhs and solve to find dd
-    rhs<<<(N+255)/256, 256>>>(b, f, d, D, N, order, *h, gammabdf, (1-kappaloc[order])*gammabdfloc[order]);
+    rhs<<<(N+255)/256, 256>>>(b, f, d, D, N, *order, *h, gammabdf, (1-kappaloc[*order])*gammabdfloc[*order]);
     cudssExecute(dsshandle, CUDSS_PHASE_SOLVE, config, data, A, dddss, bdss);
 
     //scale d and calculate norm for convergence test
@@ -197,7 +189,7 @@ int bdf_step (double *t, double *h, void* pars){
 
     //recalculate the jacobian if needed
     if(rejac){
-      step0<<<(N+255)/256, 256>>>(ytemp, D, N, order);
+      step0<<<(N+255)/256, 256>>>(ytemp, D, N, *order);
       (*jac)((*t)+(*h),ytemp,&nnz,rows,cols,vals,pars);
       refactor=1;
       rejac=0;
@@ -208,11 +200,14 @@ int bdf_step (double *t, double *h, void* pars){
     else{
       factor=0.5;
       (*h)*=factor;
+      if (*h<hmin){
+        return 0;
+      }
 
-      makeRU(RU, order, factor);
-      cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
-      updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
-      cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
+
+      makeRU(RU, *order, factor);
+      updateD<<<(N+255)/256, 256>>>(D, Dnew, N, *order, RU);
+      cudaMemcpy(D, Dnew, (*order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
 
       refactor=1; //optional?
       nconststeps=0;
@@ -221,7 +216,7 @@ int bdf_step (double *t, double *h, void* pars){
   }
 
   if(fixed){
-    cublasDcopy(handle, N, ytemp, 1, y, 1);
+    cublasDcopy(handle, N, ytemp, 1, D, 1);
     (*t)=(*t)+(*h);
     return 1;
   }
@@ -232,14 +227,11 @@ int bdf_step (double *t, double *h, void* pars){
 
   cudaMemcpy(yscale, ytemp, N*sizeof(double), cudaMemcpyDeviceToDevice);
   errscale<<<(N+255)/256, 256>>>(yscale, atl, rtl, N);
-  // cublasDnrm2(handle, N, yscale, 1, &dnorm);
-  // dnorm /= pow(N,0.5);
-  // printf("yscale2 %e\n", dnorm);
   cudaMemcpy(yerr, d, N*sizeof(double), cudaMemcpyDeviceToDevice);
   scale_err<<<(N+255)/256, 256>>>(d, yscale, yerr, N);
   cublasDnrm2(handle, N, yerr, 1, &errnorm);
-  errnorm *= (kappaloc[order]*gammabdfloc[order]+1.0/(order+1))/pow(N,0.5);
-  factor=safety * pow(errnorm, (-1.0 / (order + 1)));
+  errnorm *= (kappaloc[*order]*gammabdfloc[*order]+1.0/(*order+1))/pow(N,0.5);
+  factor=safety * pow(errnorm, (-1.0 / (*order + 1)));
 
   //reject and decrease h
   if (errnorm>1){
@@ -247,11 +239,13 @@ int bdf_step (double *t, double *h, void* pars){
         factor=0.2;
       }
       (*h)=(*h)*factor;
+      if (*h<hmin){
+        return 0;
+      }
 
-      makeRU(RU, order, factor);
-      cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
-      updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
-      cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
+      makeRU(RU, *order, factor);
+      updateD<<<(N+255)/256, 256>>>(D, Dnew, N, *order, RU);
+      cudaMemcpy(D, Dnew, (*order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
       refactor=1; //optional?
 
       nconststeps=0;
@@ -259,48 +253,43 @@ int bdf_step (double *t, double *h, void* pars){
   }
   
   //accept; update t, y, and D
-  // printf("step %i %i %e\n", ++nstep, order, (*h));
   (*t)=(*t)+(*h);
-  cudaMemcpy(y, ytemp,  N*sizeof(double), cudaMemcpyDeviceToDevice);
+  cudaMemcpy(D, ytemp,  N*sizeof(double), cudaMemcpyDeviceToDevice);
   rejac=1;
 
-  cudaMemcpy(&(D[N*(order+2)]), d,  N*sizeof(double), cudaMemcpyDeviceToDevice);
-  cublasDaxpy(handle, N, &(mone), &(D[N*(order+1)]), 1, &(D[N*(order+2)]), 1);
-  cudaMemcpy(&(D[N*(order+1)]), d,  N*sizeof(double), cudaMemcpyDeviceToDevice);
-  for (int i=order; i>=0; i--){
+  cudaMemcpy(&(D[N*(*order+2)]), d,  N*sizeof(double), cudaMemcpyDeviceToDevice);
+  cublasDaxpy(handle, N, &(mone), &(D[N*(*order+1)]), 1, &(D[N*(*order+2)]), 1);
+  cudaMemcpy(&(D[N*(*order+1)]), d,  N*sizeof(double), cudaMemcpyDeviceToDevice);
+  for (int i=*order; i>=1; i--){
     cublasDaxpy(handle, N, &one, &(D[N*(i+1)]), 1, &(D[N*(i)]), 1);
   }
 
   nconststeps++;
-  if(nconststeps>order) {
+  if(nconststeps>*order) {
     //update order and h
     double errnormminus=INFINITY, errnormplus=INFINITY, factorminus=0.0, factorplus=0.0;
     //predicted rate for order-1
-    if (order>1){
-      scale_err<<<(N+255)/256, 256>>>(&(D[N*order]), yscale, yerr, N);
+    if (*order>1){
+      scale_err<<<(N+255)/256, 256>>>(&(D[N*(*order)]), yscale, yerr, N);
       cublasDnrm2(handle, N, yerr, 1, &errnormminus);
-      errnormminus *= (kappaloc[order-1]*gammabdfloc[order-1]+1.0/(order))/pow(N,0.5);
-      factorminus=safety * pow(errnormminus, (-1.0 / (order)));
+      errnormminus *= (kappaloc[*order-1]*gammabdfloc[*order-1]+1.0/(*order))/pow(N,0.5);
+      factorminus=safety * pow(errnormminus, (-1.0 / (*order)));
 
     }
     //predicted rate for order+1
-    if (order<5){
-      scale_err<<<(N+255)/256, 256>>>(&(D[N*(order+2)]), yscale, yerr, N);
+    if ( *order<5){
+      scale_err<<<(N+255)/256, 256>>>(&(D[N*(*order+2)]), yscale, yerr, N);
       cublasDnrm2(handle, N, yerr, 1, &errnormplus);
-      errnormplus *= (kappaloc[order+1]*gammabdfloc[order+1]+1.0/(order+2))/pow(N,0.5);
-      factorplus=safety * pow(errnormplus, (-1.0 / (order + 2)));
-    }  
-
-    // printf("errnormminus %e\n", errnormminus);
-    // printf("errnorm %e\n", errnorm);
-    // printf("errnormplus %e\n", errnormplus);
+      errnormplus *= (kappaloc[*order+1]*gammabdfloc[*order+1]+1.0/(*order+2))/pow(N,0.5);
+      factorplus=safety * pow(errnormplus, (-1.0 / (*order + 2)));
+    }
 
     int dorder=0;
-    if (order>1 && factorminus > factor && factorminus > factorplus){
+    if ( *order>1 && factorminus > factor && factorminus > factorplus){
       factor=factorminus;
       dorder=-1;
     }
-    else if (order<5 && factorplus > factor){
+    else if ( *order<5 && factorplus > factor){
       factor=factorplus;
       dorder=1;
     }
@@ -308,26 +297,18 @@ int bdf_step (double *t, double *h, void* pars){
       factor=10;
     }
 
-    (*h)=(*h)*factor;
-    order+=dorder;
+    if ((*h)*factor>hmax){
+      factor=hmax/(*h);
+      *h=hmax;
+    }
+    else{
+      (*h)=(*h)*factor;
+    }
+    *order+=dorder;
 
-    makeRU(RU, order, factor);
-    cudaMemcpy(RU, RUloc, (order+1)*(order+1)*sizeof(double), cudaMemcpyHostToDevice);
-
-    // for (int i=0; i<order+1; i++){
-    //   cublasDnrm2(handle, N, &(D[N*i]), 1, &dnorm);
-    //   dnorm *= 1.0/pow(N,0.5);
-    //   printf("old Dnorm %i %e\n", i, dnorm);
-    // }
-    
-    updateD<<<(N+255)/256, 256>>>(D, Dnew, N, order, RU);
-    cudaMemcpy(D, Dnew, (order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
-
-    // for (int i=0; i<order+1; i++){
-    //   cublasDnrm2(handle, N, &(D[N*i]), 1, &dnorm);
-    //   dnorm *= 1.0/pow(N,0.5);
-    //   printf("new Dnorm %i %e\n", i, dnorm);
-    // }
+    makeRU(RU, *order, factor);    
+    updateD<<<(N+255)/256, 256>>>(D, Dnew, N, *order, RU);
+    cudaMemcpy(D, Dnew, (*order+1)*N*sizeof(double), cudaMemcpyDeviceToDevice);
 
     nconststeps=0;
     refactor=1;
@@ -335,45 +316,43 @@ int bdf_step (double *t, double *h, void* pars){
   return 1;
 }
 
-double *bdf_eval(const double t, const double h, const double t_eval){
+double* bdf_eval(const double t, const double h, const double order, const double t_eval){
   interpolate<<<(N+255)/256, 256>>>(y_eval, D, N, order, h, t_eval, t);
   return y_eval;
 }
 
-double* bdf_run(double *t, double *h, double t1, void *pars, void (*step_eval)(double, double, double*, void*)){
-  cudaMalloc ((void**)&y_eval, N*sizeof(double));
-  double zero=0.0;
-  (*dydt)(*t,y,f,pars);
-  (*jac)((*t),y,&nnz,rows,cols,vals,pars);
+void bdf_run(double *t, double *h, double hmin, double hmax,int *order, double t1, void *pars, void (*step_eval)(double, double, double*, void*)){
 
   size_t bufferSize;
-  double factor=-(*h)/((1-kappaloc[order])*gammabdfloc[order]);
-  cusparseDcsrgeam2_bufferSizeExt(sphandle,N,N,&one,Idesc,N,Ivals,Irows,Icols,&factor,Jdesc,nnz,vals,rows,cols,Adesc,Avals,Arows,Acols,&bufferSize);
+  double alpha=-(*h)/((1-kappaloc[*order])*gammabdfloc[*order]);
+  (*dydt)(*t,D,f,pars);
+  (*jac)((*t),D,&nnz,rows,cols,vals,pars);
+  cusparseDcsrgeam2_bufferSizeExt(sphandle,N,N,&one,Idesc,N,Ivals,Irows,Icols,&alpha,Jdesc,nnz,vals,rows,cols,Adesc,Avals,Arows,Acols,&bufferSize);
   cudaMalloc(&buffer, bufferSize);
   cusparseXcsrgeam2Nnz(sphandle,N,N,Idesc,N,Irows,Icols,Jdesc,nnz,rows,cols,Adesc,Arows,&nnzA,buffer);
-  
-  makeA(factor);
+  cusparseDcsrgeam2(sphandle,N,N,&one,Idesc,N,Ivals,Irows,Icols,&alpha,Jdesc,nnz,vals,rows,cols,Adesc,Avals,Arows,Acols,buffer);
+
   cudssMatrixCreateCsr(&A, N, N, nnzA, Arows, NULL, Acols, Avals, CUDSS_R_32I, CUDSS_R_32I, CUDSS_R_64F, CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO);
   cudssMatrixCreateDn(&dddss, N, 1, N, dd, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR);
   cudssMatrixCreateDn(&bdss, N, 1, N, b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR);
 
-  cublasDscal(handle, 8*N, &zero, D, 1);
-  cudaMemcpy (&(D[0]), y, N*sizeof(double), cudaMemcpyDeviceToDevice);
-  cudaMemcpy (&(D[N]), f, N*sizeof(double), cudaMemcpyDeviceToDevice);
-  cublasDscal(handle, N, h, &(D[N]), 1);
-
   cudssExecute(dsshandle, CUDSS_PHASE_ANALYSIS, config, data, A, dddss, bdss);
   cudssExecute(dsshandle, CUDSS_PHASE_FACTORIZATION, config, data, A, dddss, bdss);
-  
 
-  while(*t<t1){
+  if(*order==0){
+    cudaMemcpy (&(D[N]), f, N*sizeof(double), cudaMemcpyDeviceToDevice);
+    cublasDscal(handle, N, h, &(D[N]), 1);
+    *order=1;
+  }
+
+  while(*t<t1 && *h>hmin){
     // let us integrate beyond t1 so if we restart there is no artifact
     // if(*t+*h>t1)
     //   *h=t1-*t;
 
-    int success=bdf_step (t, h, pars);
+    int success=bdf_step (t, h, hmin, hmax, order, pars);
     if(success){
-      (*step_eval)(*t,*h,y,pars);
+      (*step_eval)(*t,*h,D,pars);
     }
   }
 
@@ -381,10 +360,9 @@ double* bdf_run(double *t, double *h, double t1, void *pars, void (*step_eval)(d
   cudssMatrixDestroy(A);
   cudssMatrixDestroy(dddss);
   cudssMatrixDestroy(bdss);
-  return y;
 }
 
-double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, double *yloc, cublasHandle_t h, void (*func)(double, double*, double*, void*), void (*jac_func)(double, double*, int*, int*, int*, double*, void*)){
+double* bdf_init(int *order, int n, int nnzmax, double atol, double rtol, int fixedstep, double *yloc, cublasHandle_t h, void (*func)(double, double*, double*, void*), void (*jac_func)(double, double*, int*, int*, int*, double*, void*)){
   N=n;
   rtl=rtol;
   atl=atol;
@@ -402,7 +380,6 @@ double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, dou
 
   handle=h;
 
-  cudaMalloc ((void**)&y, N*sizeof(double));
   cudaMalloc ((void**)&yscale, N*sizeof(double));
   cudaMalloc ((void**)&yerr, N*sizeof(double));
   cudaMalloc ((void**)&ytemp, N*sizeof(double));
@@ -412,11 +389,9 @@ double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, dou
   cudaMalloc ((void**)&b, N*sizeof(double));
   cudaMalloc ((void**)&D, 8*N*sizeof(double));
   cudaMalloc ((void**)&Dnew, 8*N*sizeof(double));
-  
-
   cudaMalloc ((void**)&gammabdf, 6*sizeof(double));
+  cudaHostAlloc((void**)&RUloc, 36*sizeof(double), cudaHostAllocDefault);
   cudaMalloc ((void**)&RU, 36*sizeof(double));
-
   cudaMalloc ((void**)&rows, (N+1)*sizeof(int));
   cudaMalloc ((void**)&cols, nnzmax*sizeof(int));
   cudaMalloc ((void**)&vals, nnzmax*sizeof(double));
@@ -426,6 +401,7 @@ double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, dou
   cudaMalloc ((void**)&Irows, (N+1)*sizeof(int));
   cudaMalloc ((void**)&Icols, N*sizeof(int));
   cudaMalloc ((void**)&Ivals, N*sizeof(double));
+  cudaMalloc ((void**)&y_eval, N*sizeof(double));
 
   double *Ivalsloc=(double *) malloc(N*sizeof(double));
   int *Irowsloc=(int *) malloc((N+1)*sizeof(int));
@@ -436,14 +412,15 @@ double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, dou
     Ivalsloc[i] = 1.0;
   }
   Irowsloc[N] = N; 
-
   cudaMemcpy(Irows, Irowsloc, (N+1)*sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(Icols, Icolsloc, N*sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(Ivals, Ivalsloc, N*sizeof(double), cudaMemcpyHostToDevice);
+  free(Ivalsloc);
+  free(Irowsloc);
+  free(Icolsloc);
 
-  cudaMemcpy (y, yloc, N*sizeof(double), cudaMemcpyHostToDevice);
-  cudaMemcpy (D, yloc, N*sizeof(double), cudaMemcpyHostToDevice);
   cudaMemcpy (gammabdf, gammabdfloc, 6*sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy (D, yloc, N*(*(order)+1)*sizeof(double), cudaMemcpyHostToDevice);
   cudssCreate(&dsshandle);
   cudssConfigCreate(&config);
   cudssDataCreate(dsshandle,&data);
@@ -454,14 +431,40 @@ double* bdf_init(int n, int nnzmax, double atol, double rtol, int fixedstep, dou
   cusparseCreateMatDescr(&Idesc);
   cusparseCreateMatDescr(&Adesc);
 
-  
-
-  return y;
+  return D;
 }
 
 void bdf_destroy(){
-  cudaFree(y);
+  cudaFree(yscale);
   cudaFree(yerr);
   cudaFree(ytemp);
+  cudaFree(f);
+  cudaFree(d);
+  cudaFree(dd);
+  cudaFree(b);
+  cudaFree(D);
+  cudaFree(Dnew);
+  cudaFree(gammabdf);
+  cudaFree(RUloc);
+  cudaFreeHost(RU);
+  cudaFree(rows);
+  cudaFree(cols);
+  cudaFree(vals);
+  cudaFree(Arows);
+  cudaFree(Acols);
+  cudaFree(Avals);
+  cudaFree(Irows);
+  cudaFree(Icols);
+  cudaFree(Ivals);
   cudaFree(y_eval);
+
+  cudssDataDestroy(dsshandle,data);
+  cudssDestroy(dsshandle);
+  cudssConfigDestroy(config);
+
+  cusparseDestroy(sphandle);
+
+  cusparseDestroyMatDescr(Jdesc);
+  cusparseDestroyMatDescr(Idesc);
+  cusparseDestroyMatDescr(Adesc);
 }

@@ -1,6 +1,6 @@
 //Zachary G. Nicolaou 2/4/2024
 //Dormand Prince 4/5 stepper on the GPU
-#include "dp45_64.h"
+#include "dp45.h"
 
 //dp45 coefficients
 const double a1loc[1] = {1.0/5};
@@ -84,7 +84,7 @@ __global__ void error (double *y, double *ytemp, double* k1, double* k2, double*
 }
 
 //Attempt a DP step
-int dp45_step (double *t, double *h, void* pars){
+int dp45_step (double *t, double *h, double hmin, double hmax, void* pars){
   double norm=0;
   //Calculate the intermediate steps and error estimates using the CUDA kernels
   step2<<<(N+255)/256, 256>>>(y, k1, ytemp, a1, *h, N);
@@ -108,8 +108,8 @@ int dp45_step (double *t, double *h, void* pars){
 
   if(fixed){
     t_last=*t;
-    cublasDcopy(handle, N, y, 1, ylast, 1);
-    cublasDcopy(handle, N, ytemp, 1, y, 1);
+    cudaMemcpy(ylast, y, N*sizeof(double), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(y, ytemp, N*sizeof(double), cudaMemcpyDeviceToDevice);
     (*t)=(*t)+(*h);
     return 1;
   }
@@ -121,20 +121,24 @@ int dp45_step (double *t, double *h, void* pars){
     //Accept or reject the step and update the step size
     if(norm<1){
       t_last=*t;
-      cublasDcopy(handle, N, y, 1, ylast, 1);
-      cublasDcopy(handle, N, ytemp, 1, y, 1);
+      cudaMemcpy(ylast, y, N*sizeof(double), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(y, ytemp, N*sizeof(double), cudaMemcpyDeviceToDevice);
 
 
       (*t)=(*t)+(*h);
       if (factor>10)
         factor=10;
       (*h)*=factor;
+      if (*h>hmax)
+        *h=hmax;
       return 1;
     }
     else if (factor<1){
       if (factor<0.2)
         factor=0.2;
       (*h)*=factor;
+      if (*h<hmin)
+        return 0;
     }
   }
   return 0;
@@ -145,22 +149,21 @@ double *dp45_eval(const double t,const double t_eval){
   return y_eval;
 }
 
-double* dp45_run(double *t, double *h, double t1, void *pars, void (*step_eval)(double, double, double*, void*)){
+void dp45_run(double *t, double *h, double hmin, double hmax, double t1, void *pars, void (*step_eval)(double, double, double*, void*)){
 
   cudaMalloc ((void**)&y_eval, N*sizeof(double));
   (*dydt)(*t,y,k1,pars);
 
-  while(*t<t1){
+  while(*t<t1 && *h>hmin){
     // if(*t+*h>t1)
     //   *h=t1-*t;
 
-    int success=dp45_step (t, h, pars);
+    int success=dp45_step (t, h, hmin, hmax, pars);
     if(success){
       (*step_eval)(*t,*h,y,pars);
-      cublasDcopy(handle, N, k7, 1, k1, 1);
+      cudaMemcpy(k1, k7, N*sizeof(double), cudaMemcpyDeviceToDevice);
     }
   }
-  return y;
 }
 
 double* dp45_init(int n, double atol, double rtol, int fixedstep, double *yloc, cublasHandle_t h, void (*func)(double, double*, double*, void*)){
@@ -246,6 +249,4 @@ void dp45_destroy(){
   cudaFree(p5);
   cudaFree(p6);
   cudaFree(p7);
-
-
 }

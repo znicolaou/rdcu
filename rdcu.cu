@@ -1,12 +1,12 @@
 //Zachary G. Nicolaou 6/16/2026
-//nvcc -lcufft -lcublas -O3 -o rdcu dp45_64.cu rdcu.cu
+//nvcc -lcufft -lcublas -O3 -o rdcu dp45.cu rdcu.cu
 //./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c -0.8,0,0,2,1,1 -c -0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c 0.8,1,0,3 -c 0.8,1,0,1,1,2 -v -D3 2dcgle
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include "dp45_64.h"
+#include "dp45.h"
 #include "bdf.h"
 #include "cublas_v2.h"
 #include <cufft.h>
@@ -62,6 +62,7 @@ typedef struct parameters
   double *valsloc;
   char *filebase;
   int *colsorder;
+  int order;
   struct timeval start;
   FILE *out;
   FILE *outtimes;
@@ -274,7 +275,7 @@ void step_eval(double t, double h, double* y, void *pars){
       y_eval=dp45_eval(t,p->t_eval[p->eval_i]);
     }
     else{
-      y_eval=bdf_eval(t,h,p->t_eval[p->eval_i]);
+      y_eval=bdf_eval(t,h,p->order,p->t_eval[p->eval_i]);
     }
     if(p->dense>=1){
       cudaMemcpy(p->yloc, y_eval, p->N*p->n*sizeof(double), cudaMemcpyDeviceToHost);
@@ -319,6 +320,15 @@ void step_eval(double t, double h, double* y, void *pars){
     fwrite(p->yloc,sizeof(double),p->N*p->n,outlast);
     fwrite(&t,sizeof(double),1,outlast);
     fwrite(&h,sizeof(double),1,outlast);
+
+    if(p->stiff){
+      fwrite(&p->order,sizeof(int),1,outlast);
+      for (int i=1; i<=p->order; i++){
+        cudaMemcpy(p->yloc, &(y[p->N*p->n*i]), p->N*p->n*sizeof(double), cudaMemcpyDeviceToHost);
+        fwrite(p->yloc,sizeof(double),p->N*p->n,outlast);
+      }
+    }
+
     fflush(outlast);
     fclose(outlast);
   }
@@ -569,7 +579,14 @@ void init_dY(int *Nsloc, double *Lsloc, void *pars){
     cudaMemcpy(p->dYrows[i], dYrowsloc[i], p->dYnnz[i]*sizeof(int), cudaMemcpyHostToDevice); 
     cudaMemcpy(p->dYcols[i], dYcolsloc[i], p->dYnnz[i]*sizeof(int), cudaMemcpyHostToDevice); 
     cudaMemcpy(p->dYvals[i], dYvalsloc[i], p->dYnnz[i]*sizeof(double), cudaMemcpyHostToDevice); 
+    free(dYrowsloc[i]);
+    free(dYcolsloc[i]);
+    free(dYvalsloc[i]);
   }
+  free(ns);  
+  free(dYrowsloc);
+  free(dYcolsloc);
+  free(dYvalsloc);
 }
 
 
@@ -577,7 +594,8 @@ int main (int argc, char* argv[]) {
     struct timeval start,end;
     gettimeofday(&start,NULL);
 
-    double t1=1e2, dt=1e0, atl=1e-6, rtl=1e-6, A=1.0;
+    double t1=1e2, dt=1e0, atl=1e-8, rtl=1e-8, A=1.0;
+    double h=0.0, hmin=0, hmax=INFINITY;
     int gpu=0, seed=1, fixed=0, n=1, ndim=1, nterms=0, ndim2=0, verbose=0, help=1, dense=1, stiff=0, reload=0;
     int Nsloc[3]={128,128,128}, *c[1024]={0}, nprods[1024]={0};
     double Lsloc[3]={1.0,1.0,1.0}, C[1024]={0};
@@ -649,7 +667,16 @@ int main (int argc, char* argv[]) {
           }
           case 'd': {
             if (optarg != NULL) {
-              dt = (double)atof(optarg);
+              double dts[4];
+              int ndts=0;
+              fparse_list(optarg, delim, dts, &ndts, 4);
+              dt = dts[0];
+              if (ndts > 1)
+                h = dts[1];
+              if (ndts > 2)
+                hmin = dts[2];
+              if (ndts > 3)
+                hmax = dts[3];
             }
             break;
           }
@@ -693,11 +720,12 @@ int main (int argc, char* argv[]) {
     }
 
     if (help) {
-      printf("usage:\trdcu [-hvFR] [-n NFIELDS] [-N NUMS] [-L LENGTHS]\n");
+      printf("usage:\trdcu [-hvSFR] [-n NFIELDS] [-N NUMS] [-L LENGTHS]\n");
       printf("\t[-c COUPLING] [-A AMPLITUDE] [-t TIME] [-d DT] [-s SEED] \n");
       printf("\t[-D DENSITY] [-g GPU] [-r RTOL] [-a ATOL]  FILEBASE \n\n");
       printf("-h for help \n");
       printf("-v for verbose output, including progress \n");
+      printf("-S for stiff systems. Uses BDF method with finite differences instead of RK45 with pseudospectral. \n");
       printf("-F for fixed timestep \n");
       printf("-R to reload initial conditions from files if possible\n");
       printf("NFIELDS is the number of fields. Default 1\n");
@@ -713,6 +741,8 @@ int main (int argc, char* argv[]) {
       printf("\tYou may also provide a binary input file FILEBASEic.dat with the initial condition\n");
       printf("TIME is total integration time. Default 1e2 \n");
       printf("DT is the time between outputs. Default 1e0 \n");
+      printf("\t You may include firststep, minstep, maxstep as additional comma-separated values \n");
+      printf("\t If not included, the first step is 1/100th the value of dt \n");
       printf("SEED is random seed. Default 1 \n");
       printf("GPU is index of the gpu. Default 0\n");
       printf("DENSITY is the output density. Default 1\n");
@@ -815,7 +845,7 @@ int main (int argc, char* argv[]) {
       }
     }
 
-    double t=0,h=1;
+    double t=0;
     int i=0,j=0,k=0;
     int *Ns, nnz;
     double *yloc, *y, *f, *onesloc, *ones, *term, *Ls, *valsloc;
@@ -856,30 +886,33 @@ int main (int argc, char* argv[]) {
 
     //host vector allocation
     FILE *outtimes,*outstates,*outf,*outY,*outrows,*outcols,*outvals;
-    yloc = (double*)calloc(N*n,sizeof(double));
+    cudaHostAlloc((void**)&yloc, N*n*8*sizeof(double), cudaHostAllocDefault);
     onesloc = (double*)calloc(N,sizeof(cufftDoubleComplex));
     yfftloc = (cufftDoubleComplex*)calloc(N*n*(1+ndim+ndim*ndim),sizeof(cufftDoubleComplex));
-    Yloc = (cufftDoubleComplex*)calloc(N*n*(1+ndim+ndim*ndim),sizeof(cufftDoubleComplex)); 
+    cudaHostAlloc((void**)&Yloc, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex), cudaHostAllocDefault);
     dYnnz = (int *)calloc((1+ndim+ndim*ndim),sizeof(int));
     dYrows = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
     dYcols = (int **)calloc((1+ndim+ndim*ndim),sizeof(int *));
     dYvals = (double **)calloc((1+ndim+ndim*ndim),sizeof(double *));
-    rowsloc=(int*)malloc((N*n+1)*sizeof(int));
-    colsloc=(int*)malloc(nnzmax*sizeof(int));
-    valsloc=(double*)malloc(nnzmax*sizeof(double));
+    cudaHostAlloc((void**)&rowsloc, (N*n+1)*sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc((void**)&colsloc, nnzmax*sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc((void**)&valsloc, nnzmax*sizeof(double), cudaHostAllocDefault);
 
     //host vector initialization
-    if (fixed){
-      h = dt;
-    }
-    else{
-      h = dt/100;
+    if (h<=0.0){
+      if (fixed){
+        h = dt;
+      }
+      else {
+        h = dt/100;
+      }
     }
 
     //initial conditions
     strcpy(file,filebase);
     strcat(file, "ic.dat");
     int loaded=0;
+    int order=0;
     if (in = fopen(file,"r")){
       loaded=1;
       printf("Using initial conditions from file\n");
@@ -913,6 +946,23 @@ int main (int argc, char* argv[]) {
           printf("Couldn't read start time and step!\n");
           fprintf(out,"Couldn't read start time and step!\n");
           reloaded=0;
+        }
+        //if stiff, reload order and order*N*n vales into &y[N*n]
+        if(stiff){
+          read=fread(&order,sizeof(int),1,in);
+          if (read!=1){
+            printf("Couldn't read order!\n");
+            fprintf(out,"Couldn't read order!\n");
+            reloaded=0;
+          }
+          else{
+            read=fread(&(yloc[n*N]),sizeof(double),n*N*order,in);
+            if (read!=n*N*order){
+              printf("Couldn't read backwards differences!\n");
+              fprintf(out,"Couldn't backwards differences!\n");
+              reloaded=0;
+            }
+          }
         }
       }
       fclose(in);
@@ -991,7 +1041,6 @@ int main (int argc, char* argv[]) {
     //device vector allocation
     cudaMalloc ((void**)&Ns, ndim*sizeof(int));
     cudaMalloc ((void**)&Ls, ndim*sizeof(double));
-    cudaMalloc ((void**)&y, N*n*sizeof(double));
     cudaMalloc ((void**)&f, N*n*sizeof(double));
     cudaMalloc ((void**)&term, N*sizeof(double));
     cudaMalloc ((void**)&ones, N*sizeof(double));
@@ -1013,7 +1062,7 @@ int main (int argc, char* argv[]) {
     cudaMemcpy(Ls, Lsloc, ndim*sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(ones, onesloc, N*sizeof(double), cudaMemcpyHostToDevice);
 
-    //parameters and dp45 initialization
+    //parameters and initialization
     parameters pars={.handle=handle,
       .sphandle=sphandle,
       .plans=plans,
@@ -1057,6 +1106,7 @@ int main (int argc, char* argv[]) {
       .Yloc=Yloc,
       .filebase=filebase,
       .colsorder=colsorder,
+      .order=order,
       .start=start,
       .out=out,
       .outtimes=outtimes,
@@ -1070,8 +1120,7 @@ int main (int argc, char* argv[]) {
 
     if(stiff){
       init_dY(Nsloc, Lsloc,&pars);
-      // y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
-      y=bdf_init(n*N, nnzmax, atl, rtl, fixed, yloc, handle, &dydt, &jac);
+      y=bdf_init(&pars.order, n*N, nnzmax, atl, rtl, fixed, yloc, handle, &dydt, &jac);
     }
     else{
       y=dp45_init(n*N, atl, rtl, fixed, yloc, handle, &dydt);
@@ -1112,19 +1161,14 @@ int main (int argc, char* argv[]) {
       }
     }
 
-    double *y_eval;
     if(stiff){
-      // y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
-      // y_eval=dp45_eval(t,t_eval[n_eval-1]);
-      y_eval=bdf_run(&t, &h, t1, &pars, &step_eval);
-      y_eval=bdf_eval(t,h,t_eval[n_eval-1]);
+      bdf_run(&t, &h, hmin, hmax, &(pars.order), t1, &pars, &step_eval);
     }
     else{
-      y_eval=dp45_run(&t, &h, t1, &pars, &step_eval);
-      y_eval=dp45_eval(t,t_eval[n_eval-1]);
+      dp45_run(&t, &h, hmin, hmax,t1, &pars, &step_eval);
     }
 
-    cudaMemcpy(yloc, y_eval, N*n*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(yloc, y, N*n*sizeof(double), cudaMemcpyDeviceToHost);
 
     strcpy(file,filebase);
     strcat(file,"fs.dat");
@@ -1133,6 +1177,13 @@ int main (int argc, char* argv[]) {
     fwrite(yloc,sizeof(double),N*n,outlast);
     fwrite(&t,sizeof(double),1,outlast);
     fwrite(&h,sizeof(double),1,outlast);
+    if(pars.stiff){
+      fwrite(&pars.order,sizeof(int),1,outlast);
+      for (int i=1; i<=pars.order; i++){
+        cudaMemcpy(yloc, &(y[N*n*i]), N*n*sizeof(double), cudaMemcpyDeviceToHost);
+        fwrite(yloc,sizeof(double),N*n,outlast);
+      }
+    }
 
     fflush(outlast);
     fclose(outlast);
@@ -1160,18 +1211,42 @@ int main (int argc, char* argv[]) {
       fclose(outvals);
     }
 
-    free(yloc);
-    free(Yloc);
+    cudaFreeHost(yloc);
     free(onesloc);
     free(yfftloc);
-    cudaFree(y);
-    cudaFree(f);
-    cudaFree(yfft);
-    cudaFree(Y);
+    cudaFreeHost(Yloc);
+    free(dYnnz);
+    cudaFreeHost(rowsloc);
+    cudaFreeHost(colsloc);
+    cudaFreeHost(valsloc);
+    for (int i=0; i<(1+ndim+ndim*ndim); i++){
+      cudaFree(dYrows[i]);
+      cudaFree(dYcols[i]);
+      cudaFree(dYvals[i]);
+    }
+    free(dYrows);
+    free(dYcols);
+    free(dYvals);
+    for (int i=0; i<nterms; i++){
+      free(c[i]);
+    }
+
     cudaFree(Ns);
     cudaFree(Ls);
+    cudaFree(f);
     cudaFree(term);
     cudaFree(ones);
+    cudaFree(yfft);
+    cudaFree(Y);
+    cudaFree(rows);
+    cudaFree(cols);
+    cudaFree(vals);
+    cudaFree(rowstemp);
+    cudaFree(rowstemp2);
+    cudaFree(colstemp);
+    cudaFree(colstemp2);
+    cudaFree(valstemp);
+    cudaFree(valstemp2);
 
     if (stiff){
       bdf_destroy();
@@ -1182,6 +1257,7 @@ int main (int argc, char* argv[]) {
     cublasDestroy(handle);
     cufftDestroy(plans[0]);
     cufftDestroy(plans[1]);
+    free(plans);
 
     return 0;
 }
