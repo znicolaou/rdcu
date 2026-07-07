@@ -21,7 +21,7 @@ $$
 
 is the collection of the fields and their spatial derivatives up to second order. Spatial discretization is based on a uniform grid in one, two, or three dimensions.
 
-The integration is performed on a GPU using CUDA, employing either the explicit 4/5 Dormand-Prince Runge-Kutta timestepping method with pseudospectral spatial discretization or the implicit variable-order BDF timestepping method with finite-difference derivatives for stiff systems. Finite differences ensure that the Jacobian matrix required for the BDF method is sparse, and thus, the required memory does not scale prohibitively with system size. The integration routines are based on the MATLAB ODE suite, basically porting the `ode45` and `ode15s` algorithms to the GPU. The implicit system is solved with a Newton iteration and the CUDA sparse direct LU solver cudss. 
+The integration is performed on a GPU using CUDA, employing either the explicit 4/5 Dormand-Prince Runge-Kutta timestepping method with pseudospectral spatial discretization or the implicit variable-order BDF timestepping method with finite-difference derivatives for stiff systems. Finite differences ensure that the Jacobian matrix required for the BDF method is sparse, and thus, the required memory does not scale prohibitively with system size. The integration routines are based on the MATLAB ODE suite [Shampine and Reichelt, SIAM J. Sci. Comput. **18** (1997)], basically porting the `ode45` and `ode15s` algorithms to the GPU. The implicit system is solved with a Newton iteration and the CUDA sparse direct LU solver cudss. 
 
 ## Usage
 Compile with
@@ -71,3 +71,6 @@ Indices for 1 field(s) in 1 dimension(s):
 1: u0_0
 2: u0_00
 ```
+
+## Examples
+See the Python notebook cgle.ipynb for example usage and benchmarking.
