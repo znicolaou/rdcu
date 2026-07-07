@@ -139,8 +139,6 @@ void makeY (double *y, void *pars){
         cusparseSpMV(p->sphandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, J, dy, &zero, dY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, buffer);
         cublasDcopy(p->handle, p->N, (double *)(p->yfft), 1, (double *)(&(p->Y[p->N*p->n*Yind+p->N*i])), 2);
 
-        //maybe i should have a list of dnvecs that we don't recreate each time
-        //could also call preprocess
         cusparseDestroyDnVec(dy);
         cusparseDestroyDnVec(dY);
         cusparseDestroySpMat(J);
@@ -153,7 +151,6 @@ void makeY (double *y, void *pars){
     //pseudospectral
     cublasDcopy(p->handle, p->N*p->n, y, 1, (double *)(p->Y), 2);
     cufftExecZ2Z(p->plans[0], p->Y, p->yfft, CUFFT_FORWARD);
-    //in principle, we could track which derivatives are necessary and only calculate those
     for (int i=0; i<p->ndim; i++){
       d1<<<(p->N*p->n+255)/256, 256>>>(p->yfft, &(p->yfft[(i+1)*p->N*p->n]), p->N, p->n, p->Ns, p->Ls, p->ndim, i);
       for (int j=0; j<p->ndim; j++){
@@ -723,11 +720,11 @@ int main (int argc, char* argv[]) {
       printf("usage:\trdcu [-hvSFR] [-n NFIELDS] [-N NUMS] [-L LENGTHS]\n");
       printf("\t[-c COUPLING] [-A AMPLITUDE] [-t TIME] [-d DT] [-s SEED] \n");
       printf("\t[-D DENSITY] [-g GPU] [-r RTOL] [-a ATOL]  FILEBASE \n\n");
-      printf("-h for help \n");
+      printf("-h for help. Call with -n and -N to see Y indices. \n");
       printf("-v for verbose output, including progress \n");
-      printf("-S for stiff systems. Uses BDF method with finite differences instead of RK45 with pseudospectral. \n");
+      printf("-S for stiff system. Use the BDF method with finite differences instead of RK45 pseudospectral method. \n");
       printf("-F for fixed timestep \n");
-      printf("-R to reload initial conditions from files if possible\n");
+      printf("-R to reload final state from FILEBASEfs.dat if possible\n");
       printf("NFIELDS is the number of fields. Default 1\n");
       printf("NUMS is number of grid points in each dimension (up to three), separated by commas (no spaces). Default 128\n");
       printf("LENGTHS is domain length in each dimension (up to three), separated by commas (no spaces). Default 1.0\n");
@@ -744,12 +741,13 @@ int main (int argc, char* argv[]) {
       printf("\t You may include firststep, minstep, maxstep as additional comma-separated values \n");
       printf("\t If not included, the first step is 1/100th the value of dt \n");
       printf("SEED is random seed. Default 1 \n");
-      printf("GPU is index of the gpu. Default 0\n");
+      printf("GPU is the index of the gpu. Default 0\n");
       printf("DENSITY is the output density. Default 1\n");
       printf("\t1 for the timesteps (FILEBASEtimes.dat) and evaluated state values (FILEBASEstates.dat), \n");
-      printf("\t2 to include time derivatives (FILEBASEf.dat), and 3 to include factors (FILEBASEY.dat). \n");
-      printf("RTOL is relative error tolerance. Default 1E-6\n");
-      printf("ATOL is absolute error tolerance. Default 1E-6\n");
+      printf("\t2 to include time derivatives (FILEBASEf.dat), 3 to include factors (FILEBASEY.dat), \n");
+      printf("\t4 to include CSR Jacobian elements (FILEBASErows.dat, FILEBASEcols.dat, and FILEBASEvals.dat). \n");
+      printf("RTOL is relative error tolerance. Default 1E-8\n");
+      printf("ATOL is absolute error tolerance. Default 1E-8\n");
       printf("FILEBASE is base file name for output. \n");
       printf("\n");
       printf("Example: ./rdcu -N 128,128 -L 100.0,100.0 -n 2 -c 1.0,0,0,1 -c 1.0,0,6,1 -c 1.0,0,12,1 -c -2.0,0,7,1 -c -2.0,0,13,1 -c -1.0,0,0,3 -c -1.0,0,0,1,1,2 -c -0.8,0,0,2,1,1 -c -0.8,0,1,3 -c 1.0,1,1,1 -c 1.0,1,7,1 -c 1.0,1,13,1 -c 2.0,1,6,1 -c 2.0,1,12,1 -c -1.0,1,0,2,1,1 -c -1.0,1,1,3 -c 0.8,1,0,3 -c 0.8,1,0,1,1,2 -v -D3 2dcgle\n");
