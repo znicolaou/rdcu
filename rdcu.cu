@@ -771,6 +771,7 @@ int main (int argc, char* argv[]) {
       }
       exit(0);
     }
+    
     char sterms[1024][1024];    
     int l=0;
     for (int i=0; i<n; i++){
@@ -818,8 +819,8 @@ int main (int argc, char* argv[]) {
         int chars=fparse_list(line, delim, C, &nterms, 1+nterms);
         parse_list(&(line[chars]), delim, c[nterms-1], &(nprods[nterms-1]), 1024);
       } 
+      fclose(in);
     }
-    fclose(in);
 
     if(verbose){
       //print equations
