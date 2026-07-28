@@ -118,6 +118,10 @@ int dp45_step (double *t, double *h, double hmin, double hmax, void* pars){
     cublasDnrm2(handle, N, yerr, 1, &norm);
     norm/=pow(N,0.5);
     double factor=0.9*pow(norm,-0.2);
+    if (isnan(factor)){
+      factor=0.2;
+    }
+    
     //Accept or reject the step and update the step size
     if(norm<1){
       t_last=*t;
@@ -137,8 +141,6 @@ int dp45_step (double *t, double *h, double hmin, double hmax, void* pars){
       if (factor<0.2)
         factor=0.2;
       (*h)*=factor;
-      if (*h<hmin)
-        return 0;
     }
   }
   return 0;
@@ -149,7 +151,7 @@ double *dp45_eval(const double t,const double t_eval){
   return y_eval;
 }
 
-void dp45_run(double *t, double *h, double hmin, double hmax, double t1, void *pars, void (*step_eval)(double, double, double*, void*)){
+void dp45_run(double *t, double *h, double hmin, double hmax, double t1, void *pars, void (*step_eval)(double, double, double*, int, void*)){
 
   cudaMalloc ((void**)&y_eval, N*sizeof(double));
   (*dydt)(*t,y,k1,pars);
@@ -159,8 +161,8 @@ void dp45_run(double *t, double *h, double hmin, double hmax, double t1, void *p
     //   *h=t1-*t;
 
     int success=dp45_step (t, h, hmin, hmax, pars);
+    (*step_eval)(*t,*h,y,success,pars);
     if(success){
-      (*step_eval)(*t,*h,y,pars);
       cudaMemcpy(k1, k7, N*sizeof(double), cudaMemcpyDeviceToDevice);
     }
   }

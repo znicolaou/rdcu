@@ -248,10 +248,14 @@ void jac (double t, double *y, int *nnz, int *Jrows, int *Jcols, double *Jvals, 
   cusparseDestroyMatDescr(Jtempdesc);
 }
 
-void step_eval(double t, double h, double* y, void *pars){
+void step_eval(double t, double h, double* y, int success, void *pars){
   parameters *p = (parameters *)pars;
   static char file[256];
   struct timeval end;
+
+  if (!success){
+    return;
+  }
 
   p->steps++;
   if(p->verbose) {
@@ -843,6 +847,8 @@ int main (int argc, char* argv[]) {
         fprintf(out,"0\n");
       }
     }
+    fflush(stdout);
+    fflush(out);
 
     double t=0;
     int i=0,j=0,k=0;
@@ -930,6 +936,7 @@ int main (int argc, char* argv[]) {
     int reloaded=0;
     if (reload && (in = fopen(file,"r"))){
       reloaded=1;
+      loaded=1;
       printf("Reloading final conditions from file\n");
       fprintf(out, "Reloading final conditions from file\n");
       size_t read=fread(yloc,sizeof(double),n*N,in);
@@ -937,6 +944,7 @@ int main (int argc, char* argv[]) {
         printf("final conditions file not compatible with N!\n");
         fprintf(out,"final conditions file not compatible with N!\n");
         reloaded=0;
+        loaded=0;
       }
       if(reloaded){
         read=fread(&t,sizeof(double),1,in);
@@ -987,6 +995,8 @@ int main (int argc, char* argv[]) {
       fwrite(&h,sizeof(double),1,in);
       fclose(in);
     }
+
+    fflush(stdout);
 
     
     char writetype[3]="wb";

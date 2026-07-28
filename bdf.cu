@@ -321,7 +321,7 @@ double* bdf_eval(const double t, const double h, const double order, const doubl
   return y_eval;
 }
 
-void bdf_run(double *t, double *h, double hmin, double hmax,int *order, double t1, void *pars, void (*step_eval)(double, double, double*, void*)){
+void bdf_run(double *t, double *h, double hmin, double hmax,int *order, double t1, void *pars, void (*step_eval)(double, double, double*, int, void*)){
 
   size_t bufferSize;
   double alpha=-(*h)/((1-kappaloc[*order])*gammabdfloc[*order]);
@@ -351,9 +351,7 @@ void bdf_run(double *t, double *h, double hmin, double hmax,int *order, double t
     //   *h=t1-*t;
 
     int success=bdf_step (t, h, hmin, hmax, order, pars);
-    if(success){
-      (*step_eval)(*t,*h,D,pars);
-    }
+    (*step_eval)(*t,*h,D,success,pars);
   }
 
   cudaFree(buffer);
