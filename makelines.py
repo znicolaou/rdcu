@@ -92,9 +92,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=100, dest='seed', help='Random seed')
     parser.add_argument("--T0", type=float, default=0.1, dest='T0', help='Fixed step burn in time')
     parser.add_argument("--dt0", type=float, default=1E-3, dest='dt0', help='Fixed step burn in time step')
-    parser.add_argument("--T", type=float, default=500, dest='T', help='Total integration time')
+    parser.add_argument("--T", type=float, default=1000, dest='T', help='Total integration time')
     parser.add_argument("--dt", type=float, default=0.1, dest='dt', help='Integration output time step')
-    parser.add_argument("--T1", type=float, default=400, dest='T1', help='Time to start tracking lines')
+    parser.add_argument("--T1", type=float, default=900, dest='T1', help='Time to start tracking lines')
     args = parser.parse_args()
 
     Ns=np.array(args.Ns)
@@ -124,11 +124,11 @@ if __name__ == "__main__":
     file.close()
 
 
-    cmd='%s ./rdcu -s 1 -t %f -d %f -N %i,%i,%i -L %f,%f,%f -s %i -n 2 -D1 -Fv %s'%(loadstr,T0,dt0,Ns[0],Ns[1],Ns[2],Ls[0],Ls[1],Ls[2],seed,filebase)
-    print(cmd)
+    cmd='%s ./rdcu -s 1 -t %f -d %f -N %i,%i,%i -L %f,%f,%f -s %i -n 2 -D1 -F %s'%(loadstr,T0,dt0,Ns[0],Ns[1],Ns[2],Ls[0],Ls[1],Ls[2],seed,filebase)
+    print(cmd,flush=True)
     os.system(cmd)
-    cmd='%s ./rdcu -s 1 -t %f -d %f -N %i,%i,%i -L %f,%f,%f -s %i -n 2 -D1 -Rv  %s'%(loadstr,T,dt,Ns[0],Ns[1],Ns[2],Ls[0],Ls[1],Ls[2],seed,filebase)
-    print(cmd)
+    cmd='%s ./rdcu -s 1 -t %f -d %f -N %i,%i,%i -L %f,%f,%f -s %i -n 2 -D1 -R  %s'%(loadstr,T,dt,Ns[0],Ns[1],Ns[2],Ls[0],Ls[1],Ls[2],seed,filebase)
+    print(cmd,flush=True)
     os.system(cmd)
 
 
