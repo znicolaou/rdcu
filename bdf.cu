@@ -135,6 +135,7 @@ __global__ void scale_err (double *d, double *yscale, double *yerr, const unsign
 int bdf_step (double *t, double *h, double hmin, double hmax, int *order, void* pars){
   int converged=0, it=0;
   double dnorm=0, dnormold=0,rate=0,factor=1.0;
+  double h0=*h;
   //Calculate the predictor and store in ytemp
   step0<<<(N+255)/256, 256>>>(ytemp, D, N, *order);
   //find the scale for the newton iteration stopping 
@@ -155,13 +156,17 @@ int bdf_step (double *t, double *h, double hmin, double hmax, int *order, void* 
     }
     //calculate rhs and solve to find dd
     rhs<<<(N+255)/256, 256>>>(b, f, d, D, N, *order, *h, gammabdf, (1-kappaloc[*order])*gammabdfloc[*order]);
-    cudssExecute(dsshandle, CUDSS_PHASE_SOLVE, config, data, A, dddss, bdss);
-
+    cudssStatus_t status=cudssExecute(dsshandle, CUDSS_PHASE_SOLVE, config, data, A, dddss, bdss);
+    // if (status != CUDSS_STATUS_ALLOC_FAILED){
+    //   printf("CUDSS allocation failed!\n");
+    //   return 1;
+    // }
     //scale d and calculate norm for convergence test
     scale_err<<<(N+255)/256, 256>>>(dd, yscale, yerr, N);
     cublasDnrm2(handle, N, yerr, 1, &dnorm);
     dnorm /= pow(N,0.5);
     // printf("ddnorm %i %e\n", it, dnorm);
+    fflush(stdout);
     if (dnormold>0){
       rate=dnorm/dnormold;
     }
@@ -174,7 +179,7 @@ int bdf_step (double *t, double *h, double hmin, double hmax, int *order, void* 
       break;
     }
     //converged
-    if (dnormold>0 && rate/(1-rate)*dnorm < ntol){
+    if ((dnormold>0 && rate/(1-rate)*dnorm < ntol)){
       converged=1;
       break;
     }
@@ -197,7 +202,7 @@ int bdf_step (double *t, double *h, double hmin, double hmax, int *order, void* 
     }
 
     //reject and half the stepsize  
-    else{
+    else if (!fixed){
       factor=0.5;
       (*h)*=factor;
       if (*h<hmin){
@@ -217,6 +222,7 @@ int bdf_step (double *t, double *h, double hmin, double hmax, int *order, void* 
 
   if(fixed){
     cublasDcopy(handle, N, ytemp, 1, D, 1);
+    (*h) = h0;
     (*t)=(*t)+(*h);
     return 1;
   }
@@ -336,8 +342,30 @@ void bdf_run(double *t, double *h, double hmin, double hmax,int *order, double t
   cudssMatrixCreateDn(&dddss, N, 1, N, dd, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR);
   cudssMatrixCreateDn(&bdss, N, 1, N, b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR);
 
-  cudssExecute(dsshandle, CUDSS_PHASE_ANALYSIS, config, data, A, dddss, bdss);
-  cudssExecute(dsshandle, CUDSS_PHASE_FACTORIZATION, config, data, A, dddss, bdss);
+  // int alg=CUDSS_FACTORIZATION_ALG_MULTIBLOCK;
+  // cudssConfigSet(config, CUDSS_CONFIG_FACTORIZATION_ALG, &alg, sizeof(alg));
+
+  // int method=CUDSS_REORDERING_ALG_AMD;
+  // cudssConfigSet(config, CUDSS_CONFIG_REORDERING_ALG, &method, sizeof(method));
+
+  cudssStatus_t status=cudssExecute(dsshandle, CUDSS_PHASE_ANALYSIS, config, data, A, dddss, bdss);
+  if (status != CUDSS_STATUS_SUCCESS){
+    printf("CUDSS analysis failed with status %i!\n", status);
+    int info;
+    size_t sizeWritten;
+    cudssDataGet(dsshandle, data, CUDSS_DATA_INFO, &info, sizeof(info), &sizeWritten);
+    printf("cuDSS info = %d\n", info);
+    return;
+  }
+  status=cudssExecute(dsshandle, CUDSS_PHASE_FACTORIZATION, config, data, A, dddss, bdss);
+  if (status != CUDSS_STATUS_SUCCESS){
+    printf("CUDSS factorization failed with status %i!\n", status);
+    int info;
+    size_t sizeWritten;
+    cudssDataGet(dsshandle, data, CUDSS_DATA_INFO, &info, sizeof(info), &sizeWritten);
+    printf("cuDSS info = %d\n", info);
+    return;
+  }
 
   if(*order==0){
     cudaMemcpy (&(D[N]), f, N*sizeof(double), cudaMemcpyDeviceToDevice);

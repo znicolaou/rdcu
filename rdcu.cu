@@ -65,6 +65,7 @@ typedef struct parameters
   int order;
   struct timeval start;
   FILE *out;
+  FILE *outsteps;
   FILE *outtimes;
   FILE *outstates;
   FILE *outf;
@@ -253,21 +254,15 @@ void step_eval(double t, double h, double* y, int success, void *pars){
   static char file[256];
   struct timeval end;
 
+  if(p->dense>=1){
+    fwrite(&h,sizeof(double),1,p->outsteps);
+  }
+
   if (!success){
     return;
   }
 
   p->steps++;
-  if(p->verbose) {
-    gettimeofday(&end,NULL);
-    printf("%.3f\t%1.3e\t%1.3e\t%f\t%i\t\r",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
-    fflush(stdout);
-    fprintf(p->out,"%.3f\t%1.3e\t%1.3e\t%f\t%i\t\n",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
-  }
-
-  if(p->dense>=1){
-    fwrite(&t,sizeof(double),1,p->outtimes);
-  }
 
   int eval=0;
   while (t >= p->t_eval[p->eval_i] && p->eval_i<p->n_eval){
@@ -307,11 +302,21 @@ void step_eval(double t, double h, double* y, int success, void *pars){
       fflush(p->outcols);
       fflush(p->outvals);
     }
+    fwrite(&(p->t_eval[p->eval_i]),sizeof(double),1,p->outtimes);
+    fflush(p->outtimes);
     p->eval_i++;
     eval=1;
   }
   //only save fs after a eval step, in case dt is very small
   if(eval){
+    gettimeofday(&end,NULL);
+    if(p->verbose) {
+      printf("%.3f\t%1.3e\t%1.3e\t%f\t%i\t\r",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
+      fflush(stdout);
+    }
+    fprintf(p->out,"%.3f\t%1.3e\t%1.3e\t%f\t%i\t\n",(t-p->t0)/(p->t1-p->t0), end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec), (end.tv_sec-p->start.tv_sec + 1e-6*(end.tv_usec-p->start.tv_usec))/((t-p->t0+h)/(p->t1-p->t0))*(1-(t-p->t0)/(p->t1-p->t0)), h, p->steps);
+    fflush(p->out);
+
     cudaMemcpy(p->yloc, y, p->N*p->n*sizeof(double), cudaMemcpyDeviceToHost);
 
     strcpy(file,p->filebase);
@@ -595,7 +600,7 @@ int main (int argc, char* argv[]) {
     struct timeval start,end;
     gettimeofday(&start,NULL);
 
-    double t1=1e2, dt=1e0, atl=1e-8, rtl=1e-8, A=1.0;
+    double t1=1e2, dt=1e0, atl=1e-8, rtl=1e-8, A=1E-3, A0=0.0;
     double h=0.0, hmin=0, hmax=INFINITY;
     int gpu=0, seed=1, fixed=0, n=1, ndim=1, nterms=0, ndim2=0, verbose=0, help=1, dense=1, stiff=0, reload=0;
     int Nsloc[3]={128,128,128}, *c[1024]={0}, nprods[1024]={0};
@@ -656,7 +661,12 @@ int main (int argc, char* argv[]) {
           }
           case 'A': {
             if (optarg != NULL) {
-              A = (double)atof(optarg);
+              double As[2];
+              int nAs=0;
+              fparse_list(optarg, delim, As, &nAs, 4);
+              A = As[0];
+              if (nAs > 1)
+                A0 = As[1];
             }
             break;
           }
@@ -862,13 +872,13 @@ int main (int argc, char* argv[]) {
     for (i=1; i<ndim; i++){
       N*=Nsloc[i];
     }
-    int nnzmax=0;
-    for (int i=0; i<nterms; i++){
-      if((nprods[i]-1)/2>nnzmax){
-        nnzmax=(nprods[i]-1)/2;
-      }
-    }
-    nnzmax*=4*N*n*nterms;
+    // int nnzmax=0;
+    // for (int i=0; i<nterms; i++){
+      // if((nprods[i]-1)/2>nnzmax){
+      //   nnzmax=(nprods[i]-1)/2;
+      // }
+    // }
+    int nnzmax=4*N*nterms;
 
     //cuda handles and plans
     cublasStatus_t stat;
@@ -890,7 +900,7 @@ int main (int argc, char* argv[]) {
     cufftPlanMany(&(plans[1]), ndim, Nsloc, Nsloc, 1, N, Nsloc, 1, N, CUFFT_Z2Z, n*(1+ndim+ndim*ndim));
 
     //host vector allocation
-    FILE *outtimes,*outstates,*outf,*outY,*outrows,*outcols,*outvals;
+    FILE *outsteps,*outtimes,*outstates,*outf,*outY,*outrows,*outcols,*outvals;
     cudaHostAlloc((void**)&yloc, N*n*8*sizeof(double), cudaHostAllocDefault);
     onesloc = (double*)calloc(N,sizeof(cufftDoubleComplex));
     yfftloc = (cufftDoubleComplex*)calloc(N*n*(1+ndim+ndim*ndim),sizeof(cufftDoubleComplex));
@@ -960,6 +970,7 @@ int main (int argc, char* argv[]) {
           if (read!=1){
             printf("Couldn't read order!\n");
             fprintf(out,"Couldn't read order!\n");
+            order=0;
             reloaded=0;
           }
           else{
@@ -982,7 +993,7 @@ int main (int argc, char* argv[]) {
       fprintf(out, "Using random initial conditions\n");
       for(i=0; i<n; i++){
         for(j=0; j<N; j++) {
-          yloc[N*i+j] = A/2*(2.0/RAND_MAX*rand()-1);
+          yloc[N*i+j] = A0+A/2*(2.0/RAND_MAX*rand()-1);
           for(k=0; k<(1+ndim+ndim*ndim); k++) {
             yfftloc[N*i*(1+ndim+ndim*ndim)+j*(1+ndim+ndim*ndim)+k] = {0.0,0.0};
           }
@@ -995,15 +1006,19 @@ int main (int argc, char* argv[]) {
       fwrite(&h,sizeof(double),1,in);
       fclose(in);
     }
-
+    fflush(out);
     fflush(stdout);
 
     
     char writetype[3]="wb";
-    if(reloaded){
+    if(loaded){
       writetype[0]='a';
     }
     if(dense>=1){
+      strcpy(file,filebase);
+      strcat(file,"steps.dat");
+      outsteps=fopen(file,writetype);
+
       strcpy(file,filebase);
       strcat(file,"times.dat");
       outtimes=fopen(file,writetype);
@@ -1055,6 +1070,7 @@ int main (int argc, char* argv[]) {
     cudaMalloc ((void**)&ones, N*sizeof(double));
     cudaMalloc ((void**)&yfft, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
     cudaMalloc ((void**)&Y, N*n*(1+ndim+ndim*ndim)*sizeof(cufftDoubleComplex));
+
     cudaMalloc ((void**)&rows, (N*n+1)*sizeof(int));
     cudaMalloc ((void**)&cols, nnzmax*sizeof(int));
     cudaMalloc ((void**)&vals, nnzmax*sizeof(double));
@@ -1118,6 +1134,7 @@ int main (int argc, char* argv[]) {
       .order=order,
       .start=start,
       .out=out,
+      .outsteps=outsteps,
       .outtimes=outtimes,
       .outstates=outstates,
       .outf=outf,
@@ -1126,9 +1143,9 @@ int main (int argc, char* argv[]) {
       .outcols=outcols,
       .outvals=outvals,
     };
-
     if(stiff){
       init_dY(Nsloc, Lsloc,&pars);
+      
       y=bdf_init(&pars.order, n*N, nnzmax, atl, rtl, fixed, yloc, handle, &dydt, &jac);
     }
     else{
@@ -1139,6 +1156,9 @@ int main (int argc, char* argv[]) {
     if (dense>=1 && !reload){
       fwrite(yloc,sizeof(double),N*n,outstates);
       fflush(outstates);
+
+      fwrite(&t,sizeof(double),1,outtimes);
+      fflush(outtimes);
     }
     
     if (dense>=2 && !reload){
@@ -1177,26 +1197,6 @@ int main (int argc, char* argv[]) {
       dp45_run(&t, &h, hmin, hmax,t1, &pars, &step_eval);
     }
 
-    cudaMemcpy(yloc, y, N*n*sizeof(double), cudaMemcpyDeviceToHost);
-
-    strcpy(file,filebase);
-    strcat(file,"fs.dat");
-    FILE *outlast=fopen(file,"wb");
-
-    fwrite(yloc,sizeof(double),N*n,outlast);
-    fwrite(&t,sizeof(double),1,outlast);
-    fwrite(&h,sizeof(double),1,outlast);
-    if(pars.stiff){
-      fwrite(&pars.order,sizeof(int),1,outlast);
-      for (int i=1; i<=pars.order; i++){
-        cudaMemcpy(yloc, &(y[N*n*i]), N*n*sizeof(double), cudaMemcpyDeviceToHost);
-        fwrite(yloc,sizeof(double),N*n,outlast);
-      }
-    }
-
-    fflush(outlast);
-    fclose(outlast);
-
     gettimeofday(&end,NULL);
     printf("\nruntime: %f\n",end.tv_sec-start.tv_sec + 1e-6*(end.tv_usec-start.tv_usec));
     fprintf(out,"\nsteps: %i\n",pars.steps);
@@ -1206,6 +1206,7 @@ int main (int argc, char* argv[]) {
     fclose(out);
     if(dense>=1){
       fclose(outtimes);
+      fclose(outsteps);
       fclose(outstates);
     }
     if(dense>=2){
