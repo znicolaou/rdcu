@@ -10,6 +10,8 @@ import pickle
 import argparse
 import sys
 import multiprocess as mp
+import torch
+
 if __name__ == '__main__':
     mp.set_start_method('spawn')
 
@@ -39,10 +41,12 @@ def findlines(th,Ns,Ls,chunk):
     nnz=lines.shape[1]
     adj=coo_array((nnz,nnz))
     for n in range(nnz//chunk+1):
-        diffs=(lines[:,n*chunk:(n+1)*chunk,np.newaxis]-lines[:,np.newaxis,:])
+        A=torch.tensor(lines[:,n*chunk:(n+1)*chunk,np.newaxis],device='cuda:0')
+        B=torch.tensor(lines[:,np.newaxis,:],device='cuda:0')
+        diffs=(A-B)
         for axis in range(3):
-            diffs[axis]=(np.mod(diffs[axis]+Ns[axis]//2,Ns[axis])-Ns[axis]//2)
-        rows,cols=np.where(np.linalg.norm(diffs,ord=1,axis=0).astype(int)==1)
+            diffs[axis]=(torch.remainder(diffs[axis]+Ns[axis]//2,Ns[axis])-Ns[axis]//2)
+        rows,cols=np.where(torch.linalg.norm(diffs.float(),ord=1,axis=0).cpu().numpy().astype(int)==1)
         coords=np.array([rows+n*chunk,cols])
         nnzA=len(rows)
         adj=adj+coo_array((np.ones(nnzA),coords),shape=(nnz,nnz))
@@ -70,7 +74,9 @@ def correlate(n,lines,Ns,Ls,chunk):
             nnz2=len(lines[n-1][j])
             diffs[i,j]=np.max(Ns)
             for m in range(nnz1//chunk+1):
-                dist=np.linalg.norm(lines[n][i][m*chunk:(m+1)*chunk,np.newaxis]/(Ls/(Ns-1))-lines[n-1][j][np.newaxis,:]/(Ls/(Ns-1)),ord=1,axis=-1)
+                A=torch.tensor(lines[n][i][m*chunk:(m+1)*chunk,np.newaxis]/(Ls/(Ns-1)),device='cuda:0')
+                B=torch.tensor(lines[n-1][j][np.newaxis,:]/(Ls/(Ns-1)),device='cuda:0')
+                dist=torch.linalg.norm(A-B,ord=1,axis=-1).cpu().numpy()
                 if len(dist)>0:
                     diffs[i,j]=np.min([np.round(np.min(dist)),diffs[i,j]])
     print("correlate", n, flush=True)
@@ -115,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument("--lines", type=int, default=1, dest='dolines', help='Flag to track lines')
     parser.add_argument("--states", type=int, default=1, dest='dostates', help='Flag to generate states')
     parser.add_argument("--threads", type=int, default=4, dest='threads', help='Number of threads to use')
-    parser.add_argument("--chunk", type=int, default=1024, dest='chunk', help='Chunk size')
+    parser.add_argument("--chunk", type=int, default=4096, dest='chunk', help='Chunk size')
     parser.add_argument("--rm", type=int, default=0, dest='rm', help='Remove states')
     parser.add_argument("--thr", type=int, default=5, dest='thr', help='Threshold distance for correlate between time steps')
     args = parser.parse_args()

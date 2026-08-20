@@ -30,7 +30,7 @@ for j in `seq 1 11`; do
 		#jobs
 		sleep 10
 	done
-	if [ ! -f scratch/3dcgle/${i}/${j}/states.dat ]; then 
+	if [ ! -f scratch/3dcgle/${i}/${j}/diffs.dat ]; then 
 		echo "./makelines.py --lines 0 --Ns 128 128 128 --Ls 200 200 200 --T 2000 --T1 1900 --dt1 10 --dt 0.1 --b ${b} --c ${c} --filebase scratch/3dcgle/${i}/${j}/ &"
 		./makelines.py --lines 0 --Ns 128 128 128 --Ls 200 200 200 --T 2000 --T1 1900 --dt1 10 --dt 0.1 --b ${b} --c ${c} --filebase scratch/3dcgle/${i}/${j}/ &
 	fi
