@@ -10,6 +10,9 @@ import pickle
 import argparse
 import sys
 import multiprocess as mp
+import torch
+torch.set_num_threads(1)
+
 if __name__ == '__main__':
     mp.set_start_method('spawn')
 
@@ -20,7 +23,51 @@ def wloop(th, axis1=0, axis2=1):
     dth4=np.mod(th-np.roll(th,-1,axis=axis2)+np.pi,2*np.pi)-np.pi
     return np.round((dth1+dth2+dth3+dth4)/(2*np.pi))
 
-def findlines(th,Ns,Ls,chunk):
+def findlines(th,Ns,Ls,chunk,device):
+    #each cube sharing a face with a line passing through it
+    lines01=coo_array(wloop(th, axis1=0, axis2=1)).coords
+    lines12=coo_array(wloop(th, axis1=1, axis2=2)).coords
+    lines20=coo_array(wloop(th, axis1=2, axis2=0)).coords
+    lines012=lines01+np.array([0,0,-1])[:,np.newaxis]
+    lines012[2]=np.mod(lines012[2]+Ns[2],Ns[2])
+    lines120=lines12+np.array([-1,0,0])[:,np.newaxis]
+    lines120[0]=np.mod(lines120[0]+Ns[0],Ns[0])
+    lines201=lines20+np.array([0,-1,0])[:,np.newaxis]
+    lines201[1]=np.mod(lines201[1]+Ns[1],Ns[1])
+
+    lines=np.concatenate([lines01,lines012,lines12,lines120,lines20,lines201],axis=1)
+    raveled=np.apply_along_axis(lambda row: np.ravel_multi_index(row,Ns), axis=0, arr=lines)
+    lines=np.array(np.unravel_index(np.unique(raveled),shape=Ns))
+
+    nnz=lines.shape[1]
+    adj=coo_array((nnz,nnz))
+    for n in range(nnz//chunk+1):
+        A=torch.tensor(lines[:,n*chunk:(n+1)*chunk,np.newaxis],device=device)
+        B=torch.tensor(lines[:,np.newaxis,:],device=device)
+        diffs=(A-B)
+        for axis in range(3):
+            diffs[axis]=(torch.remainder(diffs[axis]+Ns[axis]//2,Ns[axis])-Ns[axis]//2)
+        rows,cols=np.where(np.round(torch.linalg.norm(diffs.float(),ord=1,axis=0).cpu().numpy()).astype(int)==1)
+        coords=np.array([rows+n*chunk,cols])
+        nnzA=len(rows)
+        adj=adj+coo_array((np.ones(nnzA),coords),shape=(nnz,nnz))
+        
+    G=nx.from_numpy_array(adj)
+    lines=[(lines[:,list(G.subgraph(c).edges)]).transpose((1,2,0))*Ls/(Ns-1) for c in nx.connected_components(G)]
+    return lines
+    
+def savelines(n,filename,Ns,Ls,n0,chunk,device):
+    file=open(filename,'rb')
+    file.seek((n0+n)*8*2*Ns[0]*Ns[1]*Ns[2])
+    dat=file.read(8*2*Ns[0]*Ns[1]*Ns[2])
+    ys=np.array(struct.unpack('%id'%(2*Ns[0]*Ns[1]*Ns[2]),dat)).reshape([2]+Ns.tolist())
+    file.close()
+    th=np.atan2(ys[1],ys[0])+np.pi
+    lines=findlines(th,Ns,Ls,chunk,device)
+    print("savelines", n, flush=True)
+    return lines
+    
+def findlines_np(th,Ns,Ls,chunk):
     #each cube sharing a face with a line passing through it
     lines01=coo_array(wloop(th, axis1=0, axis2=1)).coords
     lines12=coo_array(wloop(th, axis1=1, axis2=2)).coords
@@ -50,8 +97,8 @@ def findlines(th,Ns,Ls,chunk):
     G=nx.from_numpy_array(adj)
     lines=[(lines[:,list(G.subgraph(c).edges)]).transpose((1,2,0))*Ls/(Ns-1) for c in nx.connected_components(G)]
     return lines
-
-def savelines(n,filename,Ns,Ls,n0,chunk):
+    
+def savelines_np(n,filename,Ns,Ls,n0,chunk):
     file=open(filename,'rb')
     file.seek((n0+n)*8*2*Ns[0]*Ns[1]*Ns[2])
     dat=file.read(8*2*Ns[0]*Ns[1]*Ns[2])
@@ -62,20 +109,74 @@ def savelines(n,filename,Ns,Ls,n0,chunk):
     print("savelines", n, flush=True)
     return lines
 
-def correlate(n,lines,Ns,Ls,chunk):
-    diffs=np.zeros((len(lines[n]),len(lines[n-1])),dtype=int)
+def correlate(n,lines,Ns,Ls,chunk,device):
+    lines1=[]
+    for i in range(len(lines[n-1])):
+        arr=np.concatenate(np.round(lines[n-1][i]/(Ls/(Ns-1))).astype(int),axis=0)
+        raveled=np.apply_along_axis(lambda row: np.ravel_multi_index(row,Ns), axis=1, arr=arr)
+        lines1=lines1+[np.array(np.unravel_index(np.unique(raveled),shape=Ns),dtype=int).T]
+    lines2=[]
     for i in range(len(lines[n])):
-        for j in range(len(lines[n-1])):
-            nnz1=len(lines[n][i])
-            nnz2=len(lines[n-1][j])
-            diffs[i,j]=np.max(Ns)
-            for m in range(nnz1//chunk+1):
-                dist=np.linalg.norm(lines[n][i][m*chunk:(m+1)*chunk,np.newaxis]/(Ls/(Ns-1))-lines[n-1][j][np.newaxis,:]/(Ls/(Ns-1)),ord=1,axis=-1)
-                if len(dist)>0:
-                    diffs[i,j]=np.min([np.round(np.min(dist)),diffs[i,j]])
+        arr=np.concatenate((lines[n][i]/(Ls/(Ns-1))).astype(int),axis=0)
+        raveled=np.apply_along_axis(lambda row: np.ravel_multi_index(row,Ns), axis=1, arr=arr)
+        lines2=lines2+[np.array(np.unravel_index(np.unique(raveled),shape=Ns),dtype=int).T]
+
+    lengths0=[len(l) for l in lines1]
+    lengths1=[len(l) for l in lines2]
+    ends0=np.concatenate([[0],np.cumsum(lengths0)])
+    ends1=np.concatenate([[0],np.cumsum(lengths1)])
+    
+    tl1=torch.vstack([torch.tensor(l,device=device) for l in lines1])
+    tl2=torch.vstack([torch.tensor(l,device=device) for l in lines2])
+    dist=np.zeros((len(tl1),len(tl2)),dtype=int)
+    for m in range(len(tl1)//chunk+1):
+        d=tl1[m*chunk:(m+1)*chunk,None]-tl2[None,:]
+        for axis in range(3):
+            d[:,:,axis]=(torch.remainder(d[:,:,axis]+Ns[axis]//2,Ns[axis])-Ns[axis]//2)
+        dist_batch=torch.linalg.norm(d.float(),ord=1,axis=-1)
+        dist[m*chunk:(m+1)*chunk]=np.round(dist_batch.cpu().numpy())
+    
+    diffs=np.zeros((len(lines[n]),len(lines[n-1])),dtype=int)
+    for i in range(len(lines[n-1])):
+        for j in range(len(lines[n])):
+            diffs[j,i]=np.min(dist[ends0[i]:ends0[i+1],ends1[j]:ends1[j+1]])
     print("correlate", n, flush=True)
     return diffs
+    
+def correlate_np(n,lines,Ns,Ls,chunk):
+    lines1=[]
+    for i in range(len(lines[n-1])):
+        arr=np.concatenate(np.round(lines[n-1][i]/(Ls/(Ns-1))).astype(int),axis=0)
+        raveled=np.apply_along_axis(lambda row: np.ravel_multi_index(row,Ns), axis=1, arr=arr)
+        lines1=lines1+[np.array(np.unravel_index(np.unique(raveled),shape=Ns),dtype=int).T]
+    lines2=[]
+    for i in range(len(lines[n])):
+        arr=np.concatenate((lines[n][i]/(Ls/(Ns-1))).astype(int),axis=0)
+        raveled=np.apply_along_axis(lambda row: np.ravel_multi_index(row,Ns), axis=1, arr=arr)
+        lines2=lines2+[np.array(np.unravel_index(np.unique(raveled),shape=Ns),dtype=int).T]
 
+    lengths0=[len(l) for l in lines1]
+    lengths1=[len(l) for l in lines2]
+    ends0=np.concatenate([[0],np.cumsum(lengths0)])
+    ends1=np.concatenate([[0],np.cumsum(lengths1)])
+    tl1=np.vstack(lines1)
+    tl2=np.vstack(lines2)
+
+    dist=np.zeros((len(tl1),len(tl2)),dtype=int)
+    for m in range(len(tl1)//chunk+1):
+        d=tl1[m*chunk:(m+1)*chunk,None]-tl2[None,:]
+        for axis in range(3):
+            d[:,:,axis]=np.mod(d[:,:,axis]+Ns[axis]//2,Ns[axis])-Ns[axis]//2
+        dist_batch=np.linalg.norm(d,ord=1,axis=-1)
+        dist[m*chunk:(m+1)*chunk]=dist_batch
+    
+    diffs=np.zeros((len(lines[n]),len(lines[n-1])),dtype=int)
+    for i in range(len(lines[n-1])):
+        for j in range(len(lines[n])):
+            diffs[j,i]=np.min(dist[ends0[i]:ends0[i+1],ends1[j]:ends1[j+1]])
+    print("correlate", n, flush=True)
+    return diffs
+    
 def loadfaces(n,filebase,Ns,n0):
     file=open(filebase+'states.dat','rb')
     file.seek((n0+n)*8*2*Ns[0]*Ns[1]*Ns[2])
@@ -114,10 +215,11 @@ if __name__ == "__main__":
     parser.add_argument("--dt1", type=float, default=0.1, dest='dt1', help='Initial integration output time step, between T0 and T1')
     parser.add_argument("--lines", type=int, default=1, dest='dolines', help='Flag to track lines')
     parser.add_argument("--states", type=int, default=1, dest='dostates', help='Flag to generate states')
-    parser.add_argument("--threads", type=int, default=4, dest='threads', help='Number of threads to use')
+    parser.add_argument("--threads", type=int, default=16, dest='threads', help='Number of threads to use')
     parser.add_argument("--chunk", type=int, default=1024, dest='chunk', help='Chunk size')
     parser.add_argument("--rm", type=int, default=0, dest='rm', help='Remove states')
     parser.add_argument("--thr", type=int, default=5, dest='thr', help='Threshold distance for correlate between time steps')
+    parser.add_argument("--device", type=str, default='cuda', dest='device', help='Device, cpu or cuda')
     args = parser.parse_args()
 
     Ns=np.array(args.Ns)
@@ -136,6 +238,7 @@ if __name__ == "__main__":
     chunk=args.chunk
     rm=args.rm
     thr=args.thr
+    device=args.device
     
     n0=1+int(T0/dt0)+int(T1/dt1)
     nt=int((T-T1)/dt)
@@ -168,7 +271,7 @@ if __name__ == "__main__":
         if not os.path.exists(filebase+'lines.dat'):
             start=timeit.default_timer()
             pool=mp.Pool(threads,maxtasksperchild=1) 
-            lines=pool.starmap(savelines,[(n,'%sstates.dat'%(filebase),Ns,Ls,n0,chunk) for n in range(nt)])
+            lines=pool.starmap(savelines,[(n,'%sstates.dat'%(filebase),Ns,Ls,n0,chunk,device) for n in range(nt)])
             pool.close()
             stop=timeit.default_timer()
             print("lines time: ", stop-start,flush=True)
@@ -181,7 +284,7 @@ if __name__ == "__main__":
             lines=pickle.load(file)
             file.close()
 
-        if not os.path.exists(filebase+'diffs.dat'):
+        if not os.path.exists(filebase+'faces.dat'):
             start=timeit.default_timer()
             pool=mp.Pool(threads,maxtasksperchild=1) 
             faces=pool.starmap(loadfaces, [(n,filebase,Ns,n0) for n in range(nt)])
@@ -199,7 +302,7 @@ if __name__ == "__main__":
         if not os.path.exists(filebase+'diffs.dat'):
             start=timeit.default_timer()
             pool=mp.Pool(threads,maxtasksperchild=1) 
-            results=pool.starmap(correlate, [(n,lines,Ns,Ls,chunk) for n in range(1,nt)])
+            results=pool.starmap(correlate, [(n,lines,Ns,Ls,chunk,device) for n in range(1,nt)])
             pool.close()
             stop=timeit.default_timer()
             print("correlate time: ", stop-start,flush=True)
